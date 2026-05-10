@@ -1,0 +1,53 @@
+{
+  "service": {
+    "host": "127.0.0.1",
+    "port": 8020,
+    "log_level": "info"
+  },
+  "engine": {
+    "backend": "stub",
+    "models": {
+      "stub-tts": {
+        "backend": "stub",
+        "enabled": true,
+        "target_inflight": 1
+      },
+      "kokoro": {
+        "backend": "kokoro",
+        "model_path": "/home/gunnar/models/kokoro",
+        "enabled": false,
+        "target_inflight": 1,
+        "kokoro_speed": 1.0,
+        "voice_presets": {
+          "English": "af_heart",
+          "British English": "bf_emma",
+          "French": "ff_siwis",
+          "Spanish": "ef_dora",
+          "Italian": "if_sara",
+          "Portuguese": "pf_dora",
+          "Brazilian Portuguese": "pf_dora",
+          "Hindi": "hf_alpha",
+          "Japanese": "jf_alpha",
+          "Chinese": "zf_xiaobei"
+        }
+      },
+      "voxcpm2": {
+        "backend": "voxcpm2",
+        "enabled": false,
+        "target_inflight": 1,
+        "voxcpm2_model_id": "openbmb/VoxCPM2",
+        "voxcpm2_load_denoiser": false,
+        "voxcpm2_optimize": false,
+        "voxcpm2_cfg_value": 2.0,
+        "voxcpm2_inference_timesteps": 10,
+        "voxcpm2_normalize": false,
+        "voxcpm2_denoise": false,
+        "voxcpm2_reference_max_duration_s": 8.0,
+        "voice_presets": {
+          "Dutch": "configured",
+          "English": "configured"
+        }
+      }
+    }
+  }
+}

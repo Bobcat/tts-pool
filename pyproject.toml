@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tts-pool-dev"
+version = "0.1.0"
+description = "FastAPI TTS pool service with a single response API across TTS engines."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn>=0.30",
+  "pydantic>=2.6",
+]
+
+[tool.setuptools]
+packages = ["app", "app.engine"]
