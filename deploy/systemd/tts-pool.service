@@ -1,0 +1,16 @@
+[Unit]
+Description=tts-pool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/gunnar/projects/tts-pool
+Environment=TTS_POOL_SETTINGS_PATH=/home/gunnar/projects/tts-pool/config/settings.json
+Environment=DEFAULT_PORT=8020
+ExecStart=/home/gunnar/projects/tts-pool/deploy/systemd/start-tts-pool.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

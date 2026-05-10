@@ -5,11 +5,11 @@
     "log_level": "info"
   },
   "engine": {
-    "backend": "stub",
+    "backend": "voxcpm2",
     "models": {
       "stub-tts": {
         "backend": "stub",
-        "enabled": true,
+        "enabled": false,
         "target_inflight": 1
       },
       "kokoro": {
@@ -33,7 +33,7 @@
       },
       "voxcpm2": {
         "backend": "voxcpm2",
-        "enabled": false,
+        "enabled": true,
         "target_inflight": 1,
         "voxcpm2_model_id": "openbmb/VoxCPM2",
         "voxcpm2_load_denoiser": false,
