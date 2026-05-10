@@ -59,8 +59,39 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
         self.assertEqual(result.metadata["reference_source_duration_ms"], 2000)
         self.assertTrue(result.metadata["reference_clipped"])
         self.assertLessEqual(result.metadata["reference_duration_ms"], 1000)
+        self.assertEqual(result.metadata["reference_audio_match"], "voice_and_pace")
         self.assertIsNotNone(model.generate_kwargs["reference_wav_path"])
         self.assertIn("Match the speaking pace", model.generate_kwargs["text"])
+
+    def test_reference_audio_can_skip_pace_control_prompt(self) -> None:
+        model = FakeVoxCPM()
+        runtime = VoxCPM2TTSRuntime(
+            model_name="voxcpm2",
+            model_settings=ModelSettings(backend="voxcpm2"),
+        )
+        runtime._model = model
+        reference = ReferenceAudio(
+            mime_type="audio/wav",
+            data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+            max_duration_s=1.0,
+        )
+
+        result = runtime.synthesize(
+            ResponseRequest(
+                model="voxcpm2",
+                input="Hallo wereld",
+                language="Dutch",
+                voice=VoiceSpec(
+                    preset="configured",
+                    reference_audio=reference,
+                    reference_audio_match="voice",
+                ),
+            )
+        )
+
+        self.assertEqual(result.metadata["reference_audio_match"], "voice")
+        self.assertIsNotNone(model.generate_kwargs["reference_wav_path"])
+        self.assertNotIn("Match the speaking pace", model.generate_kwargs["text"])
 
     def test_unknown_voice_preset_is_rejected(self) -> None:
         runtime = VoxCPM2TTSRuntime(

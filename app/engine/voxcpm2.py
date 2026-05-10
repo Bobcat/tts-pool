@@ -137,7 +137,7 @@ class VoxCPM2TTSRuntime:
                 raise ValueError(f"unsupported voxcpm2 voice preset: {preset}")
             _append_unique(fragments, VOICE_PRESETS[preset])
         _append_unique(fragments, str(request.voice.instructions or "").strip())
-        if request.voice.reference_audio is not None:
+        if request.voice.reference_audio is not None and request.voice.reference_audio_match == "voice_and_pace":
             _append_unique(fragments, REFERENCE_CONTROL)
         return " ".join(fragments).strip()
 
@@ -156,6 +156,7 @@ class VoxCPM2TTSRuntime:
         metadata: dict[str, Any] = {
             "reference_audio": True,
             "reference_mime_type": reference_audio.mime_type,
+            "reference_audio_match": request.voice.reference_audio_match,
             "reference_max_duration_s": max_duration_s,
             "reference_source_duration_ms": original_duration_ms,
         }
