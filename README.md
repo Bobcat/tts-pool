@@ -1,0 +1,310 @@
+# tts-pool
+
+FastAPI TTS pool with Kokoro and VoxCPM2 backends, a single `POST /v1/responses`
+synthesis API, runtime model load/unload, queue scheduling, and admin endpoints
+for model state and GPU memory inspection.
+
+## Index
+
+- [Overview](#overview)
+- [HTTP API](#http-api)
+- [Synthesis Example](#synthesis-example)
+- [Request Fields](#request-fields)
+- [Voice And Reference Audio](#voice-and-reference-audio)
+- [Local Overrides](#local-overrides)
+- [Timing Metrics](#timing-metrics)
+- [Deployment Notes](#deployment-notes)
+- [Test](#test)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
+
+## Overview
+
+- one synthesis API across configured TTS backends
+- Kokoro backend through `realtime-tts-engine`
+- VoxCPM2 backend through `voxcpm`
+- JSON response envelopes with base64 WAV audio
+- runtime metrics included in synthesis responses
+- admin endpoints for inspecting models and loading or unloading them at runtime
+- in-process scheduler/executor layer in front of synthesis
+- per-model queueing, runtime inflight tracking, and configurable target inflight
+- GPU memory inspection endpoint for operational visibility
+
+The service follows the broad `llm-pool` shape, but uses a TTS-native response
+contract instead of text-token generation.
+
+## HTTP API
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/responses` | Synthesize text to WAV audio through a loaded TTS model. |
+| `GET /v1/models` | List currently loaded model ids. |
+| `GET /v1/admin/models` | List configured model ids plus runtime state, queue state, capabilities, and definitions. |
+| `GET /v1/admin/gpu-memory` | Return current GPU memory usage plus per-model artifact estimates. |
+| `POST /v1/admin/models/{model_name}/load` | Load one configured model at runtime. |
+| `POST /v1/admin/models/{model_name}/unload` | Gracefully unload one loaded model. |
+
+See [docs/api.md](docs/api.md) for shorter API notes.
+
+## Synthesis Example
+
+Example request:
+
+```json
+{
+  "model": "voxcpm2",
+  "input": "Let's see if this works.",
+  "language": "English",
+  "voice": {
+    "preset": "configured",
+    "instructions": "Use natural intonation.",
+    "reference_audio": {
+      "mime_type": "audio/wav",
+      "data_base64": "...",
+      "max_duration_s": 4
+    },
+    "reference_audio_match": "voice"
+  },
+  "format": {
+    "type": "wav"
+  },
+  "generation": {
+    "voxcpm2": {
+      "cfg_value": 2.0,
+      "inference_timesteps": 10,
+      "normalize": false,
+      "denoise": false
+    }
+  },
+  "stream": false
+}
+```
+
+Example response shape:
+
+```json
+{
+  "id": "ttsresp_123",
+  "object": "tts_response",
+  "model": "voxcpm2",
+  "audio": {
+    "mime_type": "audio/wav",
+    "data_base64": "...",
+    "sample_rate_hz": 48000,
+    "duration_ms": 1440
+  },
+  "metrics": {
+    "engine_queue_wait_ms": 0.0,
+    "backend_synthesis_wall_ms": 420.5,
+    "engine_total_wall_ms": 421.1,
+    "pool_total_wall_ms": 421.8,
+    "voxcpm2_generate_wall_ms": 410.2,
+    "output_audio_seconds": 1.44,
+    "realtime_factor": 0.29
+  },
+  "metadata": {
+    "engine": "voxcpm2",
+    "device": "cuda",
+    "reference_audio": true,
+    "reference_audio_match": "voice"
+  }
+}
+```
+
+`stream: true` is intentionally rejected in the current version. The response
+contains base64 WAV audio so callers can stay stateless and remote-friendly.
+
+## Request Fields
+
+Currently supported API request fields:
+
+| Field | Type | Required | Default if omitted | Notes |
+| --- | --- | --- | --- | --- |
+| `model` | `string` | yes | none | Must match a currently loaded model id. |
+| `input` | `string` | yes | none | Text to synthesize. |
+| `language` | `string` | yes | none | Language label passed to the selected backend. |
+| `voice` | `object` | no | `{}` | Backend-specific voice preset, instructions, and optional reference audio. |
+| `format.type` | `"wav"` | no | `"wav"` | WAV is the only supported output format. |
+| `generation` | `object` | no | `{}` | Backend-specific generation overrides. |
+| `stream` | `boolean` | no | `false` | `true` currently returns `400 stream_unsupported`. |
+
+Kokoro generation fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `generation.kokoro.speed` | `float \| null` | Optional temporary speed override for the request. |
+
+VoxCPM2 generation fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `generation.voxcpm2.cfg_value` | `float \| null` | Classifier-free guidance value. |
+| `generation.voxcpm2.inference_timesteps` | `int \| null` | Diffusion sampling steps. |
+| `generation.voxcpm2.normalize` | `boolean \| null` | Request-level text normalization toggle. |
+| `generation.voxcpm2.denoise` | `boolean \| null` | Request-level denoise toggle for prompt/reference audio when denoiser support is loaded. |
+
+## Voice And Reference Audio
+
+`voice.preset` is interpreted by the selected backend:
+
+- Kokoro expects a Kokoro voice id such as `af_heart`.
+- VoxCPM2 accepts the configured presets exposed by this service, including
+  `configured`, `neutral_clear`, `warm_female`, `calm_male`, and
+  `focused_narrator`.
+
+`voice.instructions` is currently used by VoxCPM2 and ignored by Kokoro.
+
+VoxCPM2 supports `voice.reference_audio`:
+
+```json
+{
+  "mime_type": "audio/wav",
+  "data_base64": "...",
+  "max_duration_s": 8
+}
+```
+
+The service clips reference WAV audio to the configured/requested maximum before
+passing it to VoxCPM2. `voice.reference_audio_match` controls whether the
+reference sample only supplies voice characteristics or also adds an explicit
+pace/rhythm/articulation instruction:
+
+| Value | Behavior |
+| --- | --- |
+| `voice` | Use the reference audio as voice sample only. |
+| `voice_and_pace` | Use the reference audio and add a soft instruction to match speaking pace, rhythm, and articulation. |
+
+## Local Overrides
+
+Shared defaults live in `config/settings.json`. Machine-local overrides belong
+in ignored `config/local.json`. When present, `local.json` is merged over
+`settings.json`.
+
+Settings files can also be selected explicitly:
+
+- `TTS_POOL_SETTINGS_PATH`: base settings file path
+- `TTS_POOL_LOCAL_SETTINGS_PATH`: local override file path
+
+Example local override:
+
+```json
+{
+  "service": {
+    "host": "127.0.0.1",
+    "port": 8020
+  },
+  "engine": {
+    "models": {
+      "kokoro": {
+        "model_path": "/path/to/kokoro",
+        "enabled": false
+      },
+      "voxcpm2": {
+        "enabled": true,
+        "target_inflight": 1,
+        "voxcpm2_model_id": "openbmb/VoxCPM2",
+        "voxcpm2_reference_max_duration_s": 8.0
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- Models without a `backend` field use the global `engine.backend`.
+- `enabled` controls whether a model is loaded at service startup.
+- A configured model with `enabled: false` may still be loaded later through the
+  admin API.
+- `target_inflight` is configured per model id and applied through the scheduler.
+- VoxCPM2 dependencies are installed by the base project dependencies.
+- Kokoro dependencies are loaded lazily and are required only when a Kokoro model
+  is configured and loaded.
+
+## Timing Metrics
+
+The response `metrics` payload uses nested timers:
+
+- `backend_synthesis_wall_ms`
+  time spent inside the selected TTS runtime
+- `engine_total_wall_ms`
+  backend synthesis plus queueing, scheduling, and other engine work around it
+- `pool_total_wall_ms`
+  total time spent inside the `tts-pool` request handler
+
+The payload may also include runtime-specific counters and sub-timers:
+
+- `engine_queue_wait_ms`
+  time spent waiting in the per-model scheduler queue
+- `engine_outside_backend_wall_ms`
+  engine time not spent inside backend synthesis
+- `input_chars`
+  input text length
+- `output_audio_seconds`
+  generated audio duration
+- `realtime_factor`
+  synthesis wall time divided by output audio duration
+- `voxcpm2_generate_wall_ms`
+  VoxCPM2 model generation time
+- `voxcpm2_wav_encode_ms`
+  WAV encoding time after VoxCPM2 generation
+
+Some fields are backend-dependent and may be omitted.
+
+## Deployment Notes
+
+The service can be run directly:
+
+```bash
+python3 -m venv .venv
+./.venv/bin/python -m pip install -e .
+./.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8020
+```
+
+The `deploy/systemd` directory contains a user-service example. Those files are
+intentionally small, but they include absolute paths for one host layout. For a
+different machine, copy the unit and start script or provide a user-level
+systemd drop-in that sets the correct working directory, settings path, host,
+and port.
+
+Expected example layout:
+
+```bash
+~/projects/tts-pool
+```
+
+Useful systemd commands after adapting the paths:
+
+```bash
+systemctl --user status tts-pool.service
+journalctl --user -u tts-pool.service -f
+systemctl --user restart tts-pool.service
+```
+
+## Test
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Additional checks used during development:
+
+```bash
+python3 -m py_compile app/main.py app/config.py app/schemas.py app/engine/common.py app/engine/router.py app/engine/scheduler.py app/engine/stub.py app/engine/kokoro.py app/engine/voxcpm2.py
+python3 -m pip check
+git diff --check
+```
+
+## Acknowledgments
+
+This pool builds on a number of upstream projects:
+
+- FastAPI
+- Uvicorn
+- Pydantic
+- Kokoro
+- VoxCPM2
+
+## License
+
+No license file is currently included.
