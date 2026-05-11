@@ -146,6 +146,8 @@ def model_definition_payload(model_settings: ModelSettings, *, resolved_backend:
                 "voxcpm2_normalize": model_settings.voxcpm2_normalize,
                 "voxcpm2_denoise": model_settings.voxcpm2_denoise,
                 "voxcpm2_reference_max_duration_s": model_settings.voxcpm2_reference_max_duration_s,
+                "voxcpm2_warmup_enabled": model_settings.voxcpm2_warmup_enabled,
+                "voxcpm2_warmup_cases": [vars(case) for case in model_settings.voxcpm2_warmup_cases],
             }
         )
     return payload

@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import io
+import logging
+import math
 from pathlib import Path
+import struct
 import tempfile
 import time
 from typing import Any
 import wave
 
 from app.config import ModelSettings
+from app.config import VoxCPM2WarmupCase
 from app.schemas import EngineResult
 from app.schemas import ResponseRequest
 
 from .common import decode_reference_audio
 
+
+LOGGER = logging.getLogger("tts_pool.engine.voxcpm2")
 
 VOICE_PRESETS = {
     "configured": "",
@@ -22,6 +28,42 @@ VOICE_PRESETS = {
     "focused_narrator": "Use a focused narrator voice with crisp diction.",
 }
 REFERENCE_CONTROL = "Match the speaking pace, rhythm, and articulation of the reference audio."
+DEFAULT_WARMUP_CASES = (
+    VoxCPM2WarmupCase(
+        name="short_no_ref_10",
+        text="Let's see if this works.",
+        reference_audio=False,
+        inference_timesteps=10,
+    ),
+    VoxCPM2WarmupCase(
+        name="short_ref_voice_10",
+        text="Let's see if this works.",
+        reference_audio=True,
+        reference_audio_match="voice",
+        inference_timesteps=10,
+    ),
+    VoxCPM2WarmupCase(
+        name="medium_ref_voice_and_pace_10",
+        text="Let's see if this works clearly enough for live translation.",
+        reference_audio=True,
+        reference_audio_match="voice_and_pace",
+        inference_timesteps=10,
+    ),
+    VoxCPM2WarmupCase(
+        name="medium_ref_voice_and_pace_6",
+        text="Let's see if this works clearly enough for live translation.",
+        reference_audio=True,
+        reference_audio_match="voice_and_pace",
+        inference_timesteps=6,
+    ),
+    VoxCPM2WarmupCase(
+        name="medium_ref_voice_and_pace_4",
+        text="Let's see if this works clearly enough for live translation.",
+        reference_audio=True,
+        reference_audio_match="voice_and_pace",
+        inference_timesteps=4,
+    ),
+)
 
 
 class VoxCPM2TTSRuntime:
@@ -33,7 +75,8 @@ class VoxCPM2TTSRuntime:
         self._model: Any | None = None
 
     def load(self) -> None:
-        self._model_instance()
+        model = self._model_instance()
+        self._warmup(model)
 
     def close(self) -> None:
         self._model = None
@@ -170,6 +213,61 @@ class VoxCPM2TTSRuntime:
         metadata["reference_duration_ms"] = clipped_duration_ms
         return clipped_path, metadata
 
+    def _warmup(self, model: Any) -> None:
+        if not self.model_settings.voxcpm2_warmup_enabled:
+            return
+
+        cases = self.model_settings.voxcpm2_warmup_cases or DEFAULT_WARMUP_CASES
+        LOGGER.info("VoxCPM2 warmup started model=%s cases=%s", self.model_name, len(cases))
+        started = time.perf_counter()
+        with tempfile.TemporaryDirectory(prefix="tts-pool-voxcpm2-warmup-") as tmpdir_name:
+            tmpdir = Path(tmpdir_name)
+            reference_paths: dict[float, Path] = {}
+            for index, case in enumerate(cases, start=1):
+                reference_path = None
+                if case.reference_audio:
+                    reference_path = reference_paths.get(case.reference_duration_s)
+                    if reference_path is None:
+                        reference_path = tmpdir / f"reference-{len(reference_paths) + 1}.wav"
+                        _write_warmup_reference_wav(reference_path, duration_s=case.reference_duration_s)
+                        reference_paths[case.reference_duration_s] = reference_path
+
+                cfg_value = (
+                    self.model_settings.voxcpm2_cfg_value if case.cfg_value is None else float(case.cfg_value)
+                )
+                inference_timesteps = (
+                    self.model_settings.voxcpm2_inference_timesteps
+                    if case.inference_timesteps is None
+                    else int(case.inference_timesteps)
+                )
+                case_started = time.perf_counter()
+                model.generate(
+                    text=_voxcpm2_text(case.text, _control_for_warmup_case(case)),
+                    reference_wav_path=str(reference_path) if reference_path is not None else None,
+                    cfg_value=cfg_value,
+                    inference_timesteps=inference_timesteps,
+                    normalize=self.model_settings.voxcpm2_normalize,
+                    denoise=self.model_settings.voxcpm2_denoise,
+                )
+                LOGGER.info(
+                    "VoxCPM2 warmup case completed model=%s index=%s/%s name=%s reference_audio=%s "
+                    "reference_audio_match=%s inference_timesteps=%s wall_ms=%.1f",
+                    self.model_name,
+                    index,
+                    len(cases),
+                    case.name or f"case_{index}",
+                    case.reference_audio,
+                    case.reference_audio_match,
+                    inference_timesteps,
+                    (time.perf_counter() - case_started) * 1000.0,
+                )
+        LOGGER.info(
+            "VoxCPM2 warmup completed model=%s cases=%s wall_ms=%.1f",
+            self.model_name,
+            len(cases),
+            (time.perf_counter() - started) * 1000.0,
+        )
+
 
 def _append_unique(items: list[str], value: str) -> None:
     clean = str(value or "").strip()
@@ -183,6 +281,32 @@ def _voxcpm2_text(text: str, control: str) -> str:
     if safe_control:
         return f"({safe_control}){safe_text}"
     return safe_text
+
+
+def _control_for_warmup_case(case: VoxCPM2WarmupCase) -> str:
+    fragments: list[str] = []
+    preset = str(case.voice_preset or "configured").strip() or "configured"
+    if preset not in VOICE_PRESETS:
+        raise ValueError(f"unsupported voxcpm2 warmup voice preset: {preset}")
+    _append_unique(fragments, VOICE_PRESETS[preset])
+    reference_match = str(case.reference_audio_match or "voice").strip() or "voice"
+    if reference_match not in {"voice", "voice_and_pace"}:
+        raise ValueError(f"unsupported voxcpm2 warmup reference_audio_match: {reference_match}")
+    if case.reference_audio and reference_match == "voice_and_pace":
+        _append_unique(fragments, REFERENCE_CONTROL)
+    return " ".join(fragments).strip()
+
+
+def _write_warmup_reference_wav(path: Path, *, duration_s: float, sample_rate_hz: int = 16000) -> None:
+    frame_count = max(1, int(duration_s * sample_rate_hz))
+    amplitude = 0.12 * 32767.0
+    with wave.open(str(path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate_hz)
+        for index in range(frame_count):
+            sample = int(amplitude * math.sin(2.0 * math.pi * 220.0 * index / sample_rate_hz))
+            writer.writeframesraw(struct.pack("<h", sample))
 
 
 def _wav_duration_ms(path: Path) -> int:

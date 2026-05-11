@@ -14,6 +14,18 @@ VOXCPM2_DEFAULT_MODEL_ID = "openbmb/VoxCPM2"
 
 
 @dataclass(frozen=True)
+class VoxCPM2WarmupCase:
+    name: str = ""
+    text: str = "Let's see if this works."
+    reference_audio: bool = False
+    reference_audio_match: str = "voice"
+    reference_duration_s: float = 4.0
+    voice_preset: str = "configured"
+    cfg_value: float | None = None
+    inference_timesteps: int | None = None
+
+
+@dataclass(frozen=True)
 class ServiceSettings:
     host: str = "127.0.0.1"
     port: int = 8020
@@ -37,6 +49,8 @@ class ModelSettings:
     voxcpm2_normalize: bool = False
     voxcpm2_denoise: bool = False
     voxcpm2_reference_max_duration_s: float = 8.0
+    voxcpm2_warmup_enabled: bool = False
+    voxcpm2_warmup_cases: tuple[VoxCPM2WarmupCase, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -99,6 +113,8 @@ def load_settings(path: str | Path | None = None) -> AppSettings:
                 minimum=1.0,
                 maximum=60.0,
             ),
+            voxcpm2_warmup_enabled=bool(model_payload.get("voxcpm2_warmup_enabled", False)),
+            voxcpm2_warmup_cases=_voxcpm2_warmup_cases(model_payload.get("voxcpm2_warmup_cases")),
         )
 
     return AppSettings(
@@ -165,3 +181,31 @@ def _optional_str(value: Any) -> str | None:
 def _bounded_float(value: Any, *, minimum: float, maximum: float) -> float:
     parsed = float(value)
     return max(minimum, min(maximum, parsed))
+
+
+def _voxcpm2_warmup_cases(value: Any) -> tuple[VoxCPM2WarmupCase, ...]:
+    if not isinstance(value, list):
+        return ()
+    cases: list[VoxCPM2WarmupCase] = []
+    for item in value:
+        payload = _dict(item)
+        if not payload:
+            continue
+        cfg_value = payload.get("cfg_value")
+        inference_timesteps = payload.get("inference_timesteps")
+        cases.append(
+            VoxCPM2WarmupCase(
+                name=str(payload.get("name", "") or "").strip(),
+                text=str(payload.get("text", "Let's see if this works.") or "").strip()
+                or "Let's see if this works.",
+                reference_audio=bool(payload.get("reference_audio", False)),
+                reference_audio_match=str(payload.get("reference_audio_match", "voice") or "voice").strip()
+                or "voice",
+                reference_duration_s=_bounded_float(payload.get("reference_duration_s", 4.0), minimum=0.2, maximum=60.0),
+                voice_preset=str(payload.get("voice_preset", "configured") or "configured").strip()
+                or "configured",
+                cfg_value=None if cfg_value is None else max(0.1, float(cfg_value)),
+                inference_timesteps=None if inference_timesteps is None else max(1, int(inference_timesteps)),
+            )
+        )
+    return tuple(cases)

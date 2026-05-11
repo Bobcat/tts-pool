@@ -9,6 +9,7 @@ from unittest import mock
 import numpy as np
 
 from app.config import ModelSettings
+from app.config import VoxCPM2WarmupCase
 from app.engine.voxcpm2 import VoxCPM2TTSRuntime
 from app.schemas import ReferenceAudio
 from app.schemas import ResponseRequest
@@ -24,9 +25,11 @@ class FakeVoxCPM:
     def __init__(self) -> None:
         self.tts_model = FakeTTSModel()
         self.generate_kwargs = None
+        self.generate_calls = []
 
     def generate(self, **kwargs):
         self.generate_kwargs = kwargs
+        self.generate_calls.append(kwargs)
         return np.zeros(1600, dtype=np.float32)
 
 
@@ -119,6 +122,55 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
         with mock.patch("builtins.__import__", side_effect=ImportError("missing")):
             with self.assertRaises(RuntimeError):
                 runtime.load()
+
+    def test_load_runs_default_warmup_cases_when_enabled(self) -> None:
+        model = FakeVoxCPM()
+        runtime = VoxCPM2TTSRuntime(
+            model_name="voxcpm2",
+            model_settings=ModelSettings(
+                backend="voxcpm2",
+                voxcpm2_warmup_enabled=True,
+            ),
+        )
+        runtime._model = model
+
+        runtime.load()
+
+        self.assertEqual(len(model.generate_calls), 5)
+        self.assertEqual({4, 6, 10}, {call["inference_timesteps"] for call in model.generate_calls})
+        self.assertTrue(any(call["reference_wav_path"] is None for call in model.generate_calls))
+        self.assertTrue(any(call["reference_wav_path"] is not None for call in model.generate_calls))
+        self.assertTrue(any("Match the speaking pace" in call["text"] for call in model.generate_calls))
+
+    def test_load_runs_configured_warmup_cases(self) -> None:
+        model = FakeVoxCPM()
+        runtime = VoxCPM2TTSRuntime(
+            model_name="voxcpm2",
+            model_settings=ModelSettings(
+                backend="voxcpm2",
+                voxcpm2_warmup_enabled=True,
+                voxcpm2_warmup_cases=(
+                    VoxCPM2WarmupCase(
+                        name="custom",
+                        text="Custom warmup",
+                        reference_audio=True,
+                        reference_audio_match="voice_and_pace",
+                        cfg_value=1.5,
+                        inference_timesteps=6,
+                    ),
+                ),
+            ),
+        )
+        runtime._model = model
+
+        runtime.load()
+
+        self.assertEqual(len(model.generate_calls), 1)
+        self.assertEqual(model.generate_kwargs["cfg_value"], 1.5)
+        self.assertEqual(model.generate_kwargs["inference_timesteps"], 6)
+        self.assertIsNotNone(model.generate_kwargs["reference_wav_path"])
+        self.assertIn("Custom warmup", model.generate_kwargs["text"])
+        self.assertIn("Match the speaking pace", model.generate_kwargs["text"])
 
 
 def _silent_wav(*, seconds: float, sample_rate_hz: int = 16000) -> bytes:

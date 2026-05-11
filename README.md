@@ -45,6 +45,8 @@ contract instead of text-token generation.
 | `POST /v1/admin/models/{model_name}/unload` | Gracefully unload one loaded model. |
 
 See [docs/api.md](docs/api.md) for shorter API notes.
+See [docs/voxcpm2-optimization.md](docs/voxcpm2-optimization.md) for the current
+VoxCPM2 optimization findings and warmup configuration.
 
 ## Synthesis Example
 
@@ -203,7 +205,9 @@ Example local override:
         "enabled": true,
         "target_inflight": 1,
         "voxcpm2_model_id": "openbmb/VoxCPM2",
-        "voxcpm2_reference_max_duration_s": 8.0
+        "voxcpm2_optimize": true,
+        "voxcpm2_reference_max_duration_s": 8.0,
+        "voxcpm2_warmup_enabled": true
       }
     }
   }
@@ -216,6 +220,8 @@ Notes:
 - `enabled` controls whether a model is loaded at service startup.
 - A configured model with `enabled: false` may still be loaded later through the
   admin API.
+- `voxcpm2_warmup_enabled` runs a bounded default warmup suite after VoxCPM2
+  loads. Custom `voxcpm2_warmup_cases` can be added in `local.json`.
 - `target_inflight` is configured per model id and applied through the scheduler.
 - VoxCPM2 dependencies are installed by the base project dependencies.
 - Kokoro dependencies are loaded lazily and are required only when a Kokoro model

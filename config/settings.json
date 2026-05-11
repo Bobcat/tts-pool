@@ -43,6 +43,7 @@
         "voxcpm2_normalize": false,
         "voxcpm2_denoise": false,
         "voxcpm2_reference_max_duration_s": 8.0,
+        "voxcpm2_warmup_enabled": false,
         "voice_presets": {
           "Dutch": "configured",
           "English": "configured"
