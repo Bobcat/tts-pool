@@ -331,4 +331,4 @@ This pool builds on a number of upstream projects:
 
 ## License
 
-No license file is currently included.
+Apache License 2.0. See [LICENSE](LICENSE).

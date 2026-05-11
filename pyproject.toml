@@ -7,6 +7,7 @@ name = "tts-pool-dev"
 version = "0.1.0"
 description = "FastAPI TTS pool service with a single response API across TTS engines."
 requires-python = ">=3.11"
+license = {file = "LICENSE"}
 dependencies = [
   "fastapi>=0.110",
   "uvicorn>=0.30",
