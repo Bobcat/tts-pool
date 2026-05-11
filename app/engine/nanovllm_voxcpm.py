@@ -31,7 +31,7 @@ DEFAULT_WARMUP_CASES = (
         text="Let's see if this works.",
         reference_audio=False,
         temperature=0.01,
-        max_generate_length=256,
+        max_generate_length=64,
     ),
     NanoVLLMWarmupCase(
         name="short_ref_voice",
@@ -40,7 +40,7 @@ DEFAULT_WARMUP_CASES = (
         reference_audio_match="voice",
         reference_duration_s=2.0,
         temperature=0.01,
-        max_generate_length=256,
+        max_generate_length=64,
     ),
     NanoVLLMWarmupCase(
         name="short_ref_voice_and_pace",
@@ -49,7 +49,7 @@ DEFAULT_WARMUP_CASES = (
         reference_audio_match="voice_and_pace",
         reference_duration_s=2.0,
         temperature=0.01,
-        max_generate_length=256,
+        max_generate_length=64,
     ),
 )
 
