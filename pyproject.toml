@@ -14,5 +14,12 @@ dependencies = [
   "voxcpm==2.0.2",
 ]
 
+[project.optional-dependencies]
+kokoro = [
+  "kokoro>=0.9.2",
+  "misaki[ja,zh]>=0.9.4",
+  "numpy>=1.26",
+]
+
 [tool.setuptools]
 packages = ["app", "app.engine"]
