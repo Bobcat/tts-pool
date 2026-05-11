@@ -150,7 +150,56 @@ def model_definition_payload(model_settings: ModelSettings, *, resolved_backend:
                 "voxcpm2_warmup_cases": [vars(case) for case in model_settings.voxcpm2_warmup_cases],
             }
         )
+    elif resolved_backend == "nanovllm_voxcpm":
+        payload.update(
+            {
+                "nanovllm_model_id": model_settings.nanovllm_model_id,
+                "nanovllm_devices": list(model_settings.nanovllm_devices),
+                "nanovllm_max_num_seqs": model_settings.nanovllm_max_num_seqs,
+                "nanovllm_max_num_batched_tokens": model_settings.nanovllm_max_num_batched_tokens,
+                "nanovllm_max_model_len": model_settings.nanovllm_max_model_len,
+                "nanovllm_gpu_memory_utilization": model_settings.nanovllm_gpu_memory_utilization,
+                "nanovllm_inference_timesteps": model_settings.nanovllm_inference_timesteps,
+                "nanovllm_max_generate_length": model_settings.nanovllm_max_generate_length,
+                "nanovllm_temperature": model_settings.nanovllm_temperature,
+                "nanovllm_cfg_value": model_settings.nanovllm_cfg_value,
+                "nanovllm_reference_max_duration_s": model_settings.nanovllm_reference_max_duration_s,
+            }
+        )
     return payload
+
+
+def _voxcpm2_languages() -> list[str]:
+    return [
+        "Arabic",
+        "Chinese",
+        "Danish",
+        "Dutch",
+        "English",
+        "Finnish",
+        "French",
+        "German",
+        "Greek",
+        "Hebrew",
+        "Hindi",
+        "Indonesian",
+        "Italian",
+        "Japanese",
+        "Khmer",
+        "Korean",
+        "Lao",
+        "Malay",
+        "Norwegian",
+        "Polish",
+        "Portuguese",
+        "Russian",
+        "Spanish",
+        "Swahili",
+        "Swedish",
+        "Tagalog",
+        "Thai",
+        "Turkish",
+    ]
 
 
 def capabilities_for_backend(backend: str, model_settings: ModelSettings) -> dict[str, Any]:
@@ -189,36 +238,7 @@ def capabilities_for_backend(backend: str, model_settings: ModelSettings) -> dic
         }
     if normalized == "voxcpm2":
         return {
-            "languages": [
-                "Arabic",
-                "Chinese",
-                "Danish",
-                "Dutch",
-                "English",
-                "Finnish",
-                "French",
-                "German",
-                "Greek",
-                "Hebrew",
-                "Hindi",
-                "Indonesian",
-                "Italian",
-                "Japanese",
-                "Khmer",
-                "Korean",
-                "Lao",
-                "Malay",
-                "Norwegian",
-                "Polish",
-                "Portuguese",
-                "Russian",
-                "Spanish",
-                "Swahili",
-                "Swedish",
-                "Tagalog",
-                "Thai",
-                "Turkish",
-            ],
+            "languages": _voxcpm2_languages(),
             "output_formats": ["wav"],
             "voice_presets": True,
             "voice_instructions": True,
@@ -236,6 +256,33 @@ def capabilities_for_backend(backend: str, model_settings: ModelSettings) -> dic
                 },
                 "voxcpm2.normalize": {"kind": "boolean", "default": model_settings.voxcpm2_normalize},
                 "voxcpm2.denoise": {"kind": "boolean", "default": model_settings.voxcpm2_denoise},
+            },
+            "streaming": False,
+        }
+    if normalized == "nanovllm_voxcpm":
+        return {
+            "languages": _voxcpm2_languages(),
+            "output_formats": ["wav"],
+            "voice_presets": True,
+            "voice_instructions": True,
+            "reference_audio": True,
+            "reference_audio_mime_types": ["audio/wav"],
+            "reference_audio_max_duration_s": model_settings.nanovllm_reference_max_duration_s,
+            "reference_audio_match": ["voice", "voice_and_pace"],
+            "request_generation": {
+                "nanovllm_voxcpm.cfg_value": {"kind": "number", "minimum": 0.1, "maximum": 10.0, "default": model_settings.nanovllm_cfg_value},
+                "nanovllm_voxcpm.temperature": {
+                    "kind": "number",
+                    "minimum": 0.01,
+                    "maximum": 5.0,
+                    "default": model_settings.nanovllm_temperature,
+                },
+                "nanovllm_voxcpm.max_generate_length": {
+                    "kind": "integer",
+                    "minimum": 1,
+                    "maximum": 4096,
+                    "default": model_settings.nanovllm_max_generate_length,
+                },
             },
             "streaming": False,
         }

@@ -5,13 +5,27 @@ Status: 2026-05-11.
 These notes track what we have learned while tuning VoxCPM2 in `tts-pool`,
 especially on `dc2`.
 
+## Measurement Environment
+
+Unless stated otherwise, benchmark numbers in this document were measured on
+`dc2` through the running `tts-pool` service.
+
+- Host: `dc2`
+- GPU: NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97,887 MiB VRAM
+- NVIDIA driver: 580.126.09
+- System CUDA reported by `nvidia-smi`: 13.0
+- CPU: AMD Ryzen 9 9950X 16-Core Processor
+- CPU topology: 16 cores / 32 threads
+- RAM: 60 GiB
+- Service Python: 3.12.3
+- PyTorch: 2.11.0+cu130
+- PyTorch CUDA: 13.0
+
 ## Goals
 
 - Reduce perceived latency for VoxCPM2 synthesis with reference WAV input.
-- Keep voice/reference quality high enough for the ASR -> translation -> TTS app.
+- Keep voice/reference quality high enough for live translation use.
 - Move expensive compile/warmup work out of the first real user request.
-- Keep the service architecture honest: one `/v1/responses` API, no hidden
-  in-process TTS fallback in the app.
 
 ## Findings So Far
 
@@ -41,12 +55,9 @@ more than `Dutch` versus `English` as a field value.
 
 ## What We Have Done
 
-- Deployed `tts-pool` on `dc2` as the external TTS service used by the app.
-- Kept `voxcpm2` loaded on `dc2`; `kokoro` is currently configured but not
-  loaded there.
-- Verified that the app can synthesize through remote `tts-pool`.
-- Added/requested app-side reference WAV clipping and controls for reference
-  mode and max duration.
+- Kept `voxcpm2` loaded on `dc2` for benchmarking.
+- Added service-side reference WAV clipping and request/config controls for
+  maximum reference duration.
 - Measured baseline non-optimized VoxCPM2 latency over HTTP.
 - Tested `voxcpm2_optimize=true`.
 - Found that `torch.compile` initially failed on `dc2` because Python dev
@@ -70,7 +81,7 @@ more than `Dutch` versus `English` as a field value.
 
 ## Current dc2 Runtime Setup
 
-The local override on `dc2` is:
+The shared defaults now enable VoxCPM2 optimize and warmup:
 
 ```json
 {
@@ -83,12 +94,6 @@ The local override on `dc2` is:
     }
   }
 }
-```
-
-That file lives at:
-
-```text
-~/projects/tts-pool/config/local.json
 ```
 
 The current user-service drop-in adds local Python headers and disables Inductor
@@ -148,15 +153,23 @@ After `optimize=true`, with CUDA graphs disabled:
 | medium, ref 4s, steps 4 | 1062ms | 6.08s | 0.16 |
 | long, ref 4s, steps 10 | 1950ms | 9.28s | 0.20 |
 
-One first real request shape after service start took about 5.5s because it
-triggered extra compile work. That cost should be moved into service warmup if
-we keep `optimize=true`.
+Before the custom warmup suite, one first real request shape after service start
+took about 5.5s because it triggered extra compile work.
+
+With `voxcpm2_optimize=true` and `voxcpm2_warmup_enabled=true`, one measured
+restart reached a usable `voxcpm2` model state in about 42.2s. A quick
+post-warmup check then returned:
+
+| Case | Client wall | Output audio | RTF |
+| --- | ---: | ---: | ---: |
+| short, no ref, steps 10 | 351ms | 1.60s | 0.21 |
+| medium, ref 4s, voice_and_pace, steps 10 | 721ms | 3.68s | 0.20 |
 
 ## Warmup Strategy
 
 Starting `tts-pool` is not enough. VoxCPM2's built-in warmup covers only a small
-path. We need our own warmup suite that exercises request shapes the app will
-actually use.
+path, so the service also needs warmup calls that exercise realistic request
+shapes.
 
 `tts-pool` now supports a first-class VoxCPM2 warmup switch:
 
@@ -214,27 +227,26 @@ Warmup should be shape-based, not language-based:
   - `preset=configured`;
   - optional voice description preset;
   - `reference_audio_match=voice`;
-  - `reference_audio_match=voice_and_pace` if enabled in the app.
+  - `reference_audio_match=voice_and_pace` if used by clients.
 
 Language-specific warmup is only useful if the effective control prompt or text
 shape differs enough to compile a new path. With the current integration, text
 length/tokenization matters more than the `language` metadata field.
 
-Possible implementation shape:
+Current implementation:
 
-- add a configured warmup list under `engine.models.voxcpm2`;
-- run warmups after model load and before reporting the model as loaded;
-- include synthetic short WAV reference audio generated in-process;
-- record warmup timing in logs;
-- keep the warmup suite bounded so service restart time is predictable.
+- reads an optional configured warmup list under `engine.models.voxcpm2`;
+- runs warmups after model load and before reporting the model as loaded;
+- uses synthetic short WAV reference audio generated in-process;
+- records warmup timing in logs;
+- keeps the default warmup suite bounded so service restart time is predictable.
 
 ## Next Optimization Ideas
 
 - Add admin exposure for last warmup timings.
 - Add metrics for reference encode time, generated patch count, and first
   request compile/warmup time.
-- Expose `inference_timesteps` as a user-facing TTS tuning option in the app
-  after we decide the safe presets.
+- Decide safe `inference_timesteps` presets after listening tests.
 - Test `torch.set_float32_matmul_precision("high")`; PyTorch warns that TF32
   tensor cores are available and not enabled.
 - Consider keeping `reference_max_duration_s` low, but do not expect major

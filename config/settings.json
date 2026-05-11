@@ -37,13 +37,33 @@
         "target_inflight": 1,
         "voxcpm2_model_id": "openbmb/VoxCPM2",
         "voxcpm2_load_denoiser": false,
-        "voxcpm2_optimize": false,
+        "voxcpm2_optimize": true,
         "voxcpm2_cfg_value": 2.0,
         "voxcpm2_inference_timesteps": 10,
         "voxcpm2_normalize": false,
         "voxcpm2_denoise": false,
         "voxcpm2_reference_max_duration_s": 8.0,
-        "voxcpm2_warmup_enabled": false,
+        "voxcpm2_warmup_enabled": true,
+        "voice_presets": {
+          "Dutch": "configured",
+          "English": "configured"
+        }
+      },
+      "nanovllm_voxcpm": {
+        "backend": "nanovllm_voxcpm",
+        "enabled": false,
+        "target_inflight": 4,
+        "nanovllm_model_id": "openbmb/VoxCPM2",
+        "nanovllm_devices": [0],
+        "nanovllm_max_num_seqs": 4,
+        "nanovllm_max_num_batched_tokens": 4096,
+        "nanovllm_max_model_len": 2048,
+        "nanovllm_gpu_memory_utilization": 0.85,
+        "nanovllm_inference_timesteps": 10,
+        "nanovllm_max_generate_length": 256,
+        "nanovllm_temperature": 1.0,
+        "nanovllm_cfg_value": 2.0,
+        "nanovllm_reference_max_duration_s": 8.0,
         "voice_presets": {
           "Dutch": "configured",
           "English": "configured"

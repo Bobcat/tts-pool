@@ -2,8 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="/home/gunnar/projects/tts-pool"
-PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
-VENV_BIN="$ROOT_DIR/.venv/bin"
+VENV_DIR="${TTS_POOL_VENV_DIR:-$ROOT_DIR/.venv}"
+PYTHON_BIN="$VENV_DIR/bin/python"
+VENV_BIN="$VENV_DIR/bin"
 SETTINGS_PATH="${TTS_POOL_SETTINGS_PATH:-$ROOT_DIR/config/settings.json}"
 HOST="${HOST:-127.0.0.1}"
 DEFAULT_PORT="${DEFAULT_PORT:-8020}"

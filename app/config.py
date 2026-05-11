@@ -51,6 +51,17 @@ class ModelSettings:
     voxcpm2_reference_max_duration_s: float = 8.0
     voxcpm2_warmup_enabled: bool = False
     voxcpm2_warmup_cases: tuple[VoxCPM2WarmupCase, ...] = field(default_factory=tuple)
+    nanovllm_model_id: str = VOXCPM2_DEFAULT_MODEL_ID
+    nanovllm_devices: tuple[int, ...] = (0,)
+    nanovllm_max_num_seqs: int = 4
+    nanovllm_max_num_batched_tokens: int = 4096
+    nanovllm_max_model_len: int = 2048
+    nanovllm_gpu_memory_utilization: float = 0.85
+    nanovllm_inference_timesteps: int = 10
+    nanovllm_max_generate_length: int = 256
+    nanovllm_temperature: float = 1.0
+    nanovllm_cfg_value: float = 2.0
+    nanovllm_reference_max_duration_s: float = 8.0
 
 
 @dataclass(frozen=True)
@@ -115,6 +126,26 @@ def load_settings(path: str | Path | None = None) -> AppSettings:
             ),
             voxcpm2_warmup_enabled=bool(model_payload.get("voxcpm2_warmup_enabled", False)),
             voxcpm2_warmup_cases=_voxcpm2_warmup_cases(model_payload.get("voxcpm2_warmup_cases")),
+            nanovllm_model_id=str(model_payload.get("nanovllm_model_id", VOXCPM2_DEFAULT_MODEL_ID) or "").strip()
+            or VOXCPM2_DEFAULT_MODEL_ID,
+            nanovllm_devices=_int_tuple(model_payload.get("nanovllm_devices"), default=(0,)),
+            nanovllm_max_num_seqs=max(1, int(model_payload.get("nanovllm_max_num_seqs", 4))),
+            nanovllm_max_num_batched_tokens=max(1, int(model_payload.get("nanovllm_max_num_batched_tokens", 4096))),
+            nanovllm_max_model_len=max(1, int(model_payload.get("nanovllm_max_model_len", 2048))),
+            nanovllm_gpu_memory_utilization=_bounded_float(
+                model_payload.get("nanovllm_gpu_memory_utilization", 0.85),
+                minimum=0.1,
+                maximum=1.0,
+            ),
+            nanovllm_inference_timesteps=max(1, int(model_payload.get("nanovllm_inference_timesteps", 10))),
+            nanovllm_max_generate_length=max(1, int(model_payload.get("nanovllm_max_generate_length", 256))),
+            nanovllm_temperature=_bounded_float(model_payload.get("nanovllm_temperature", 1.0), minimum=0.01, maximum=5.0),
+            nanovllm_cfg_value=max(0.1, float(model_payload.get("nanovllm_cfg_value", 2.0))),
+            nanovllm_reference_max_duration_s=_bounded_float(
+                model_payload.get("nanovllm_reference_max_duration_s", 8.0),
+                minimum=1.0,
+                maximum=60.0,
+            ),
         )
 
     return AppSettings(
@@ -176,6 +207,20 @@ def _optional_str(value: Any) -> str | None:
         return None
     parsed = str(value).strip()
     return parsed or None
+
+
+def _int_tuple(value: Any, *, default: tuple[int, ...]) -> tuple[int, ...]:
+    if isinstance(value, int):
+        return (value,)
+    if not isinstance(value, list):
+        return default
+    parsed: list[int] = []
+    for item in value:
+        try:
+            parsed.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return tuple(parsed) or default
 
 
 def _bounded_float(value: Any, *, minimum: float, maximum: float) -> float:

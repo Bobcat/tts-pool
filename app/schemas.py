@@ -37,9 +37,16 @@ class VoxCPM2GenerationParams(BaseModel):
     denoise: bool | None = None
 
 
+class NanoVLLMVoxCPMGenerationParams(BaseModel):
+    cfg_value: float | None = Field(default=None, ge=0.1, le=10.0)
+    temperature: float | None = Field(default=None, ge=0.01, le=5.0)
+    max_generate_length: int | None = Field(default=None, ge=1, le=4096)
+
+
 class GenerationParams(BaseModel):
     kokoro: KokoroGenerationParams = Field(default_factory=KokoroGenerationParams)
     voxcpm2: VoxCPM2GenerationParams = Field(default_factory=VoxCPM2GenerationParams)
+    nanovllm_voxcpm: NanoVLLMVoxCPMGenerationParams = Field(default_factory=NanoVLLMVoxCPMGenerationParams)
 
 
 class ResponseRequest(BaseModel):

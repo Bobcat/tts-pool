@@ -113,3 +113,49 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(warmup_case.reference_audio_match, "voice_and_pace")
         self.assertEqual(warmup_case.cfg_value, 1.5)
         self.assertEqual(warmup_case.inference_timesteps, 6)
+
+    def test_nanovllm_model_settings_are_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "settings.json"
+            settings_path.write_text(
+                (
+                    "{\n"
+                    '  "engine": {\n'
+                    '    "models": {\n'
+                    '      "nanovllm_voxcpm": {\n'
+                    '        "backend": "nanovllm_voxcpm",\n'
+                    '        "target_inflight": 4,\n'
+                    '        "nanovllm_model_id": "/models/VoxCPM2",\n'
+                    '        "nanovllm_devices": [0, 1],\n'
+                    '        "nanovllm_max_num_seqs": 8,\n'
+                    '        "nanovllm_max_num_batched_tokens": 2048,\n'
+                    '        "nanovllm_max_model_len": 1024,\n'
+                    '        "nanovllm_gpu_memory_utilization": 0.75,\n'
+                    '        "nanovllm_inference_timesteps": 6,\n'
+                    '        "nanovllm_max_generate_length": 128,\n'
+                    '        "nanovllm_temperature": 0.8,\n'
+                    '        "nanovllm_cfg_value": 1.5,\n'
+                    '        "nanovllm_reference_max_duration_s": 4.0\n'
+                    "      }\n"
+                    "    }\n"
+                    "  }\n"
+                    "}\n"
+                ),
+                encoding="utf-8",
+            )
+
+            settings = load_settings(settings_path)
+
+        model_settings = settings.engine.models["nanovllm_voxcpm"]
+        self.assertEqual(model_settings.backend, "nanovllm_voxcpm")
+        self.assertEqual(model_settings.nanovllm_model_id, "/models/VoxCPM2")
+        self.assertEqual(model_settings.nanovllm_devices, (0, 1))
+        self.assertEqual(model_settings.nanovllm_max_num_seqs, 8)
+        self.assertEqual(model_settings.nanovllm_max_num_batched_tokens, 2048)
+        self.assertEqual(model_settings.nanovllm_max_model_len, 1024)
+        self.assertEqual(model_settings.nanovllm_gpu_memory_utilization, 0.75)
+        self.assertEqual(model_settings.nanovllm_inference_timesteps, 6)
+        self.assertEqual(model_settings.nanovllm_max_generate_length, 128)
+        self.assertEqual(model_settings.nanovllm_temperature, 0.8)
+        self.assertEqual(model_settings.nanovllm_cfg_value, 1.5)
+        self.assertEqual(model_settings.nanovllm_reference_max_duration_s, 4.0)

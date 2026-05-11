@@ -292,4 +292,8 @@ def _build_runtime(*, model_name: str, model_settings: ModelSettings, resolved_b
         from .voxcpm2 import VoxCPM2TTSRuntime
 
         return VoxCPM2TTSRuntime(model_name=model_name, model_settings=model_settings)
+    if resolved_backend == "nanovllm_voxcpm":
+        from .nanovllm_voxcpm import NanoVLLMVoxCPMTTSRuntime
+
+        return NanoVLLMVoxCPMTTSRuntime(model_name=model_name, model_settings=model_settings)
     raise ValueError(f"unsupported backend: {resolved_backend!r}")
