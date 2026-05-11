@@ -1,8 +1,9 @@
 # tts-pool
 
-FastAPI TTS pool with Kokoro and VoxCPM2 backends, a single `POST /v1/responses`
-synthesis API, runtime model load/unload, queue scheduling, and admin endpoints
-for model state and GPU memory inspection.
+FastAPI service for serving configured text-to-speech models through one
+JSON-over-HTTP response API. It supports Kokoro, VoxCPM2, and
+NanoVLLM-VoxCPM backends, with runtime model administration, per-model
+scheduling, timing metrics, and GPU memory inspection.
 
 ## Index
 
@@ -20,18 +21,11 @@ for model state and GPU memory inspection.
 
 ## Overview
 
-- one synthesis API across configured TTS backends
-- Kokoro backend through `realtime-tts-engine`
-- VoxCPM2 backend through `voxcpm`
-- JSON response envelopes with base64 WAV audio
-- runtime metrics included in synthesis responses
-- admin endpoints for inspecting models and loading or unloading them at runtime
-- in-process scheduler/executor layer in front of synthesis
-- per-model queueing, runtime inflight tracking, and configurable target inflight
-- GPU memory inspection endpoint for operational visibility
-
-The service follows the broad `llm-pool` shape, but uses a TTS-native response
-contract instead of text-token generation.
+- `POST /v1/responses` synthesizes text to WAV audio for any loaded model id.
+- Configured model ids can use `kokoro`, `voxcpm2`, or `nanovllm_voxcpm`.
+- Responses include base64 WAV audio, timing metrics, and backend metadata.
+- Admin endpoints expose model state, runtime load/unload, queue state, and GPU memory.
+- Each loaded model has its own scheduler with configurable inflight limits.
 
 ## HTTP API
 
@@ -47,6 +41,8 @@ contract instead of text-token generation.
 See [docs/api.md](docs/api.md) for shorter API notes.
 See [docs/voxcpm2-optimization.md](docs/voxcpm2-optimization.md) for the current
 VoxCPM2 optimization findings and warmup configuration.
+See [docs/nanovllm-voxcpm-spike.md](docs/nanovllm-voxcpm-spike.md) for the
+current NanoVLLM-VoxCPM notes.
 
 ## Synthesis Example
 
@@ -58,14 +54,12 @@ Example request:
   "input": "Let's see if this works.",
   "language": "English",
   "voice": {
-    "preset": "configured",
-    "instructions": "Use natural intonation.",
+    "instructions": "Speak in English. Use a clear, natural voice.",
     "reference_audio": {
       "mime_type": "audio/wav",
       "data_base64": "...",
       "max_duration_s": 4
-    },
-    "reference_audio_match": "voice"
+    }
   },
   "format": {
     "type": "wav"
@@ -107,8 +101,7 @@ Example response shape:
   "metadata": {
     "engine": "voxcpm2",
     "device": "cuda",
-    "reference_audio": true,
-    "reference_audio_match": "voice"
+    "reference_audio": true
   }
 }
 ```
@@ -125,7 +118,7 @@ Currently supported API request fields:
 | `model` | `string` | yes | none | Must match a currently loaded model id. |
 | `input` | `string` | yes | none | Text to synthesize. |
 | `language` | `string` | yes | none | Language label passed to the selected backend. |
-| `voice` | `object` | no | `{}` | Backend-specific voice preset, instructions, and optional reference audio. |
+| `voice` | `object` | no | `{}` | Optional backend-specific voice id, instructions, and reference audio. |
 | `format.type` | `"wav"` | no | `"wav"` | WAV is the only supported output format. |
 | `generation` | `object` | no | `{}` | Backend-specific generation overrides. |
 | `stream` | `boolean` | no | `false` | `true` currently returns `400 stream_unsupported`. |
@@ -145,18 +138,24 @@ VoxCPM2 generation fields:
 | `generation.voxcpm2.normalize` | `boolean \| null` | Request-level text normalization toggle. |
 | `generation.voxcpm2.denoise` | `boolean \| null` | Request-level denoise toggle for prompt/reference audio when denoiser support is loaded. |
 
+NanoVLLM-VoxCPM generation fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `generation.nanovllm_voxcpm.cfg_value` | `float \| null` | Classifier-free guidance value. |
+| `generation.nanovllm_voxcpm.temperature` | `float \| null` | Sampling temperature. |
+| `generation.nanovllm_voxcpm.max_generate_length` | `int \| null` | Maximum generated token length. |
+
 ## Voice And Reference Audio
 
-`voice.preset` is interpreted by the selected backend:
+`voice.preset` is only for backends with native voice ids. Kokoro expects a
+voice id such as `af_heart`.
 
-- Kokoro expects a Kokoro voice id such as `af_heart`.
-- VoxCPM2 accepts the configured presets exposed by this service, including
-  `configured`, `neutral_clear`, `warm_female`, `calm_male`, and
-  `focused_narrator`.
+VoxCPM2 and NanoVLLM-VoxCPM do not define service-level voice presets. Clients
+own the prompt wording and send the final control text through
+`voice.instructions`. Kokoro ignores `voice.instructions`.
 
-`voice.instructions` is currently used by VoxCPM2 and ignored by Kokoro.
-
-VoxCPM2 supports `voice.reference_audio`:
+VoxCPM2 and NanoVLLM-VoxCPM support `voice.reference_audio`:
 
 ```json
 {
@@ -167,14 +166,9 @@ VoxCPM2 supports `voice.reference_audio`:
 ```
 
 The service clips reference WAV audio to the configured/requested maximum before
-passing it to VoxCPM2. `voice.reference_audio_match` controls whether the
-reference sample only supplies voice characteristics or also adds an explicit
-pace/rhythm/articulation instruction:
-
-| Value | Behavior |
-| --- | --- |
-| `voice` | Use the reference audio as voice sample only. |
-| `voice_and_pace` | Use the reference audio and add a soft instruction to match speaking pace, rhythm, and articulation. |
+passing it to the selected backend. If a client wants the model to follow the
+reference pace or articulation, that instruction belongs in
+`voice.instructions`.
 
 ## Local Overrides
 
@@ -208,6 +202,16 @@ Example local override:
         "voxcpm2_optimize": true,
         "voxcpm2_reference_max_duration_s": 8.0,
         "voxcpm2_warmup_enabled": true
+      },
+      "nanovllm_voxcpm": {
+        "enabled": false,
+        "target_inflight": 2,
+        "nanovllm_model_id": "openbmb/VoxCPM2",
+        "nanovllm_max_num_seqs": 2,
+        "nanovllm_max_num_batched_tokens": 2048,
+        "nanovllm_max_model_len": 1024,
+        "nanovllm_gpu_memory_utilization": 0.10,
+        "nanovllm_warmup_enabled": true
       }
     }
   }
@@ -222,17 +226,19 @@ Notes:
   admin API.
 - `voxcpm2_warmup_enabled` runs a bounded default warmup suite after VoxCPM2
   loads. Custom `voxcpm2_warmup_cases` can be added in `local.json`.
+- `nanovllm_warmup_enabled` runs a bounded request-shape warmup suite after
+  NanoVLLM-VoxCPM loads. Custom `nanovllm_warmup_cases` can be added in
+  `local.json`.
 - `target_inflight` is configured per model id and applied through the scheduler.
-- VoxCPM2 dependencies are installed by the base project dependencies.
-- Kokoro dependencies are loaded lazily and are required only when a Kokoro model
-  is configured and loaded.
+- The base dependencies include the VoxCPM2 backend package.
+- Kokoro dependencies are available through `pip install -e '.[kokoro]'`.
 
 ## Timing Metrics
 
 The response `metrics` payload uses nested timers:
 
 - `backend_synthesis_wall_ms`
-  time spent inside the selected TTS runtime
+  total wall time spent inside the selected TTS runtime
 - `engine_total_wall_ms`
   backend synthesis plus queueing, scheduling, and other engine work around it
 - `pool_total_wall_ms`
@@ -254,6 +260,18 @@ The payload may also include runtime-specific counters and sub-timers:
   VoxCPM2 model generation time
 - `voxcpm2_wav_encode_ms`
   WAV encoding time after VoxCPM2 generation
+- `nanovllm_reference_prepare_wall_ms`
+  local reference WAV decode/clip/copy time before NanoVLLM encoding
+- `nanovllm_reference_encode_wall_ms`
+  NanoVLLM reference WAV latent encoding time
+- `nanovllm_generate_wall_ms`
+  NanoVLLM-VoxCPM async generation-loop time
+- `nanovllm_first_chunk_wall_ms`
+  time to first generated audio chunk, comparable to TTFT for streaming LLMs
+- `nanovllm_wav_encode_ms`
+  WAV encoding time after NanoVLLM generation
+- `kokoro_pipeline_wall_ms`
+  Kokoro pipeline consumption time
 
 Some fields are backend-dependent and may be omitted.
 
@@ -267,17 +285,16 @@ python3 -m venv .venv
 ./.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8020
 ```
 
-The `deploy/systemd` directory contains a user-service example. Those files are
-intentionally small, but they include absolute paths for one host layout. For a
-different machine, copy the unit and start script or provide a user-level
-systemd drop-in that sets the correct working directory, settings path, host,
-and port.
-
-Expected example layout:
+The `deploy/systemd` directory contains a user-service example. The checked-in
+files assume this checkout layout:
 
 ```bash
 ~/projects/tts-pool
 ```
+
+For a different layout, edit the unit and start script or provide a user-level
+systemd drop-in that sets the working directory, settings path, host, port, and
+virtualenv path.
 
 Useful systemd commands after adapting the paths:
 
@@ -296,7 +313,7 @@ python3 -m unittest discover -s tests
 Additional checks used during development:
 
 ```bash
-python3 -m py_compile app/main.py app/config.py app/schemas.py app/engine/common.py app/engine/router.py app/engine/scheduler.py app/engine/stub.py app/engine/kokoro.py app/engine/voxcpm2.py
+python3 -m py_compile app/main.py app/config.py app/schemas.py app/engine/common.py app/engine/router.py app/engine/scheduler.py app/engine/stub.py app/engine/kokoro.py app/engine/voxcpm2.py app/engine/nanovllm_voxcpm.py
 python3 -m pip check
 git diff --check
 ```
@@ -310,6 +327,7 @@ This pool builds on a number of upstream projects:
 - Pydantic
 - Kokoro
 - VoxCPM2
+- NanoVLLM-VoxCPM
 
 ## License
 
