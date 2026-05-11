@@ -64,6 +64,8 @@
         "nanovllm_temperature": 1.0,
         "nanovllm_cfg_value": 2.0,
         "nanovllm_reference_max_duration_s": 8.0,
+        "nanovllm_warmup_enabled": false,
+        "nanovllm_warmup_cases": [],
         "voice_presets": {
           "Dutch": "configured",
           "English": "configured"

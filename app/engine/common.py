@@ -164,6 +164,8 @@ def model_definition_payload(model_settings: ModelSettings, *, resolved_backend:
                 "nanovllm_temperature": model_settings.nanovllm_temperature,
                 "nanovllm_cfg_value": model_settings.nanovllm_cfg_value,
                 "nanovllm_reference_max_duration_s": model_settings.nanovllm_reference_max_duration_s,
+                "nanovllm_warmup_enabled": model_settings.nanovllm_warmup_enabled,
+                "nanovllm_warmup_cases": [vars(case) for case in model_settings.nanovllm_warmup_cases],
             }
         )
     return payload

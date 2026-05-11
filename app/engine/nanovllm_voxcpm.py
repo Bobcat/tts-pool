@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from app.config import ModelSettings
+from app.config import NanoVLLMWarmupCase
 from app.schemas import EngineResult
 from app.schemas import ResponseRequest
 
@@ -18,11 +19,39 @@ from .voxcpm2 import _copy_wav_tail
 from .voxcpm2 import _voxcpm2_text
 from .voxcpm2 import _wav_bytes
 from .voxcpm2 import _wav_duration_ms
+from .voxcpm2 import _write_warmup_reference_wav
 from .voxcpm2 import REFERENCE_CONTROL
 from .voxcpm2 import VOICE_PRESETS
 
 
 LOGGER = logging.getLogger("tts_pool.engine.nanovllm_voxcpm")
+DEFAULT_WARMUP_CASES = (
+    NanoVLLMWarmupCase(
+        name="short_no_ref",
+        text="Let's see if this works.",
+        reference_audio=False,
+        temperature=0.01,
+        max_generate_length=256,
+    ),
+    NanoVLLMWarmupCase(
+        name="short_ref_voice",
+        text="Let's see if this works.",
+        reference_audio=True,
+        reference_audio_match="voice",
+        reference_duration_s=2.0,
+        temperature=0.01,
+        max_generate_length=256,
+    ),
+    NanoVLLMWarmupCase(
+        name="short_ref_voice_and_pace",
+        text="Let's see if this works.",
+        reference_audio=True,
+        reference_audio_match="voice_and_pace",
+        reference_duration_s=2.0,
+        temperature=0.01,
+        max_generate_length=256,
+    ),
+)
 
 
 class NanoVLLMVoxCPMTTSRuntime:
@@ -96,6 +125,7 @@ class NanoVLLMVoxCPMTTSRuntime:
         )
         await self._server.wait_for_ready()
         self._model_info = _model_info_dict(await self._server.get_model_info())
+        await self._warmup_async()
 
     async def _synthesize_async(
         self,
@@ -239,6 +269,78 @@ class NanoVLLMVoxCPMTTSRuntime:
             metadata["reference_duration_ms"] = clipped_duration_ms
             return clipped_path.read_bytes(), metadata
 
+    async def _warmup_async(self) -> None:
+        if not self.model_settings.nanovllm_warmup_enabled:
+            return
+        server = self._server
+        if server is None:
+            raise RuntimeError("NanoVLLM VoxCPM model is not loaded")
+
+        cases = self.model_settings.nanovllm_warmup_cases or DEFAULT_WARMUP_CASES
+        LOGGER.info("NanoVLLM VoxCPM warmup started model=%s cases=%s", self.model_name, len(cases))
+        started = time.perf_counter()
+        with tempfile.TemporaryDirectory(prefix="tts-pool-nanovllm-warmup-") as tmpdir_name:
+            tmpdir = Path(tmpdir_name)
+            reference_wavs: dict[float, bytes] = {}
+            for index, case in enumerate(cases, start=1):
+                reference_latents = None
+                reference_encode_ms = 0.0
+                if case.reference_audio:
+                    reference_wav = reference_wavs.get(case.reference_duration_s)
+                    if reference_wav is None:
+                        reference_path = tmpdir / f"reference-{len(reference_wavs) + 1}.wav"
+                        _write_warmup_reference_wav(reference_path, duration_s=case.reference_duration_s)
+                        reference_wav = reference_path.read_bytes()
+                        reference_wavs[case.reference_duration_s] = reference_wav
+                    encode_started = time.perf_counter()
+                    reference_latents = await server.encode_latents(reference_wav, "wav")
+                    reference_encode_ms = (time.perf_counter() - encode_started) * 1000.0
+
+                cfg_value = (
+                    self.model_settings.nanovllm_cfg_value if case.cfg_value is None else float(case.cfg_value)
+                )
+                temperature = (
+                    self.model_settings.nanovllm_temperature if case.temperature is None else float(case.temperature)
+                )
+                max_generate_length = (
+                    self.model_settings.nanovllm_max_generate_length
+                    if case.max_generate_length is None
+                    else int(case.max_generate_length)
+                )
+                generate_started = time.perf_counter()
+                chunks = 0
+                async for _chunk in server.generate(
+                    target_text=_voxcpm2_text(case.text, _control_for_warmup_case(case)),
+                    max_generate_length=max_generate_length,
+                    temperature=temperature,
+                    cfg_value=cfg_value,
+                    ref_audio_latents=reference_latents,
+                ):
+                    chunks += 1
+                generate_ms = (time.perf_counter() - generate_started) * 1000.0
+                LOGGER.info(
+                    "NanoVLLM VoxCPM warmup case completed model=%s index=%s/%s name=%s "
+                    "reference_audio=%s reference_audio_match=%s temperature=%.3f "
+                    "max_generate_length=%s reference_encode_ms=%.1f generate_ms=%.1f chunks=%s",
+                    self.model_name,
+                    index,
+                    len(cases),
+                    case.name or f"case_{index}",
+                    case.reference_audio,
+                    case.reference_audio_match,
+                    temperature,
+                    max_generate_length,
+                    reference_encode_ms,
+                    generate_ms,
+                    chunks,
+                )
+        LOGGER.info(
+            "NanoVLLM VoxCPM warmup completed model=%s cases=%s wall_ms=%.1f",
+            self.model_name,
+            len(cases),
+            (time.perf_counter() - started) * 1000.0,
+        )
+
     def _start_loop(self) -> None:
         with self._loop_lock:
             if self._loop is not None:
@@ -293,3 +395,17 @@ def _model_info_dict(model_info: Any) -> dict[str, Any]:
     if hasattr(model_info, "_asdict"):
         return dict(model_info._asdict())
     return dict(getattr(model_info, "__dict__", {}))
+
+
+def _control_for_warmup_case(case: NanoVLLMWarmupCase) -> str:
+    fragments: list[str] = []
+    preset = str(case.voice_preset or "configured").strip() or "configured"
+    if preset not in VOICE_PRESETS:
+        raise ValueError(f"unsupported nanovllm_voxcpm warmup voice preset: {preset}")
+    _append_unique(fragments, VOICE_PRESETS[preset])
+    reference_match = str(case.reference_audio_match or "voice").strip() or "voice"
+    if reference_match not in {"voice", "voice_and_pace"}:
+        raise ValueError(f"unsupported nanovllm_voxcpm warmup reference_audio_match: {reference_match}")
+    if case.reference_audio and reference_match == "voice_and_pace":
+        _append_unique(fragments, REFERENCE_CONTROL)
+    return " ".join(fragments).strip()

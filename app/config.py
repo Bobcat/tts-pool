@@ -26,6 +26,19 @@ class VoxCPM2WarmupCase:
 
 
 @dataclass(frozen=True)
+class NanoVLLMWarmupCase:
+    name: str = ""
+    text: str = "Let's see if this works."
+    reference_audio: bool = False
+    reference_audio_match: str = "voice"
+    reference_duration_s: float = 2.0
+    voice_preset: str = "configured"
+    cfg_value: float | None = None
+    temperature: float | None = None
+    max_generate_length: int | None = None
+
+
+@dataclass(frozen=True)
 class ServiceSettings:
     host: str = "127.0.0.1"
     port: int = 8020
@@ -62,6 +75,8 @@ class ModelSettings:
     nanovllm_temperature: float = 1.0
     nanovllm_cfg_value: float = 2.0
     nanovllm_reference_max_duration_s: float = 8.0
+    nanovllm_warmup_enabled: bool = False
+    nanovllm_warmup_cases: tuple[NanoVLLMWarmupCase, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -146,6 +161,8 @@ def load_settings(path: str | Path | None = None) -> AppSettings:
                 minimum=1.0,
                 maximum=60.0,
             ),
+            nanovllm_warmup_enabled=bool(model_payload.get("nanovllm_warmup_enabled", False)),
+            nanovllm_warmup_cases=_nanovllm_warmup_cases(model_payload.get("nanovllm_warmup_cases")),
         )
 
     return AppSettings(
@@ -251,6 +268,36 @@ def _voxcpm2_warmup_cases(value: Any) -> tuple[VoxCPM2WarmupCase, ...]:
                 or "configured",
                 cfg_value=None if cfg_value is None else max(0.1, float(cfg_value)),
                 inference_timesteps=None if inference_timesteps is None else max(1, int(inference_timesteps)),
+            )
+        )
+    return tuple(cases)
+
+
+def _nanovllm_warmup_cases(value: Any) -> tuple[NanoVLLMWarmupCase, ...]:
+    if not isinstance(value, list):
+        return ()
+    cases: list[NanoVLLMWarmupCase] = []
+    for item in value:
+        payload = _dict(item)
+        if not payload:
+            continue
+        cfg_value = payload.get("cfg_value")
+        temperature = payload.get("temperature")
+        max_generate_length = payload.get("max_generate_length")
+        cases.append(
+            NanoVLLMWarmupCase(
+                name=str(payload.get("name", "") or "").strip(),
+                text=str(payload.get("text", "Let's see if this works.") or "").strip()
+                or "Let's see if this works.",
+                reference_audio=bool(payload.get("reference_audio", False)),
+                reference_audio_match=str(payload.get("reference_audio_match", "voice") or "voice").strip()
+                or "voice",
+                reference_duration_s=_bounded_float(payload.get("reference_duration_s", 2.0), minimum=0.2, maximum=60.0),
+                voice_preset=str(payload.get("voice_preset", "configured") or "configured").strip()
+                or "configured",
+                cfg_value=None if cfg_value is None else max(0.1, float(cfg_value)),
+                temperature=None if temperature is None else _bounded_float(temperature, minimum=0.01, maximum=5.0),
+                max_generate_length=None if max_generate_length is None else max(1, int(max_generate_length)),
             )
         )
     return tuple(cases)

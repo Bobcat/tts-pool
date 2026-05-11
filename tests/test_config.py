@@ -135,7 +135,21 @@ class ConfigTests(unittest.TestCase):
                     '        "nanovllm_max_generate_length": 128,\n'
                     '        "nanovllm_temperature": 0.8,\n'
                     '        "nanovllm_cfg_value": 1.5,\n'
-                    '        "nanovllm_reference_max_duration_s": 4.0\n'
+                    '        "nanovllm_reference_max_duration_s": 4.0,\n'
+                    '        "nanovllm_warmup_enabled": true,\n'
+                    '        "nanovllm_warmup_cases": [\n'
+                    '          {\n'
+                    '            "name": "short_ref_voice",\n'
+                    '            "text": "Warm this NanoVLLM shape.",\n'
+                    '            "reference_audio": true,\n'
+                    '            "reference_audio_match": "voice",\n'
+                    '            "reference_duration_s": 2.0,\n'
+                    '            "voice_preset": "configured",\n'
+                    '            "cfg_value": 1.25,\n'
+                    '            "temperature": 0.01,\n'
+                    '            "max_generate_length": 64\n'
+                    "          }\n"
+                    "        ]\n"
                     "      }\n"
                     "    }\n"
                     "  }\n"
@@ -159,3 +173,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(model_settings.nanovllm_temperature, 0.8)
         self.assertEqual(model_settings.nanovllm_cfg_value, 1.5)
         self.assertEqual(model_settings.nanovllm_reference_max_duration_s, 4.0)
+        self.assertTrue(model_settings.nanovllm_warmup_enabled)
+        self.assertEqual(len(model_settings.nanovllm_warmup_cases), 1)
+        warmup_case = model_settings.nanovllm_warmup_cases[0]
+        self.assertEqual(warmup_case.name, "short_ref_voice")
+        self.assertTrue(warmup_case.reference_audio)
+        self.assertEqual(warmup_case.reference_audio_match, "voice")
+        self.assertEqual(warmup_case.reference_duration_s, 2.0)
+        self.assertEqual(warmup_case.cfg_value, 1.25)
+        self.assertEqual(warmup_case.temperature, 0.01)
+        self.assertEqual(warmup_case.max_generate_length, 64)
