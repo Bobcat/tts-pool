@@ -247,16 +247,156 @@ Still out of scope:
 - reference-latent caching across repeated calls
 - automatic per-host tuning for 16GB versus larger GPUs
 
-## Current App Routing For Local Spike
+## dc2 Blackwell Service Tuning
 
-The app repo local config has been pointed back to the local `dc1` TTS pool:
+Deployment status on 2026-05-11:
+
+- Host: `dc2`
+- GPU: NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97,887 MiB VRAM
+- Runtime venv: `.venv-nanovllm`
+- PyTorch: `2.11.0+cu128`
+- CUDA visible to PyTorch: `12.8`
+- GPU capability reported by PyTorch: `(12, 0)`
+- `flash-attn==2.8.3` was built from source on `dc2` with
+  `FLASH_ATTN_CUDA_ARCHS=120`; no community binary wheel is used for the dc2
+  deployment.
+
+The initial dc2 service config reserved too much VRAM. NanoVLLM's
+`gpu_memory_utilization` is the dominant VRAM control; the other capacity
+parameters changed reachable concurrency/limits but did not materially lower
+reserved VRAM in this setup.
+
+Measured by restarting `tts-pool.service`, waiting for `nanovllm_voxcpm` to
+reach `loaded`, then summing `nvidia-smi --query-compute-apps` memory for the
+`tts-pool/.venv-nanovllm` worker process.
+
+| Step | Changed setting | Effective config | tts-pool VRAM |
+| --- | --- | --- | ---: |
+| Baseline | none | `gpu_util=0.35`, `seqs=4`, `target=4`, `batched_tokens=4096`, `model_len=2048` | 33,854 MiB |
+| 1 | `gpu_memory_utilization=0.25` | `seqs=4`, `target=4`, `batched_tokens=4096`, `model_len=2048` | 24,206 MiB |
+| 2 | `gpu_memory_utilization=0.20` | `seqs=4`, `target=4`, `batched_tokens=4096`, `model_len=2048` | 19,310 MiB |
+| 3 | `max_num_seqs=2` | `gpu_util=0.20`, `target=4`, `batched_tokens=4096`, `model_len=2048` | 19,306 MiB |
+| 4 | `target_inflight=2` | `gpu_util=0.20`, `seqs=2`, `batched_tokens=4096`, `model_len=2048` | 19,306 MiB |
+| 5 | `max_num_batched_tokens=2048` | `gpu_util=0.20`, `seqs=2`, `target=2`, `model_len=2048` | 19,882 MiB |
+| 6 | `max_model_len=1024` | `gpu_util=0.20`, `seqs=2`, `target=2`, `batched_tokens=2048` | 19,882 MiB |
+| 7 | `gpu_memory_utilization=0.15` | `seqs=2`, `target=2`, `batched_tokens=2048`, `model_len=1024` | 14,986 MiB |
+| 8 | `gpu_memory_utilization=0.12` | `seqs=2`, `target=2`, `batched_tokens=2048`, `model_len=1024` | 12,106 MiB |
+| 9 | `gpu_memory_utilization=0.10` | `seqs=2`, `target=2`, `batched_tokens=2048`, `model_len=1024` | 10,090 MiB |
+| 10 | `gpu_memory_utilization=0.08` | `seqs=2`, `target=2`, `batched_tokens=2048`, `model_len=1024` | 10,090 MiB |
+
+Interpretation:
+
+- `gpu_memory_utilization` controls the reserved VRAM almost linearly until
+  roughly the 10 GiB floor seen at `0.10` and `0.08`.
+- Lowering `max_num_seqs` and `target_inflight` from 4 to 2 reduces concurrency
+  capacity but does not itself release meaningful VRAM after load.
+- Lowering `max_num_batched_tokens` and `max_model_len` did not reduce the
+  measured reserved VRAM in this test. It may still reduce pathological request
+  shapes and should remain conservative.
+- The current dc2 default is intentionally conservative:
+
+```json
+{
+  "target_inflight": 2,
+  "nanovllm_max_num_seqs": 2,
+  "nanovllm_max_num_batched_tokens": 2048,
+  "nanovllm_max_model_len": 1024,
+  "nanovllm_gpu_memory_utilization": 0.10
+}
+```
+
+Smoke results at the conservative setting:
+
+| Case | Wall | Pool wall | Reference encode | Generate | Output audio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| no reference | 795ms | 739ms | n/a | n/a | 1.28s |
+| 2s reference, first after restart | 1,169ms | 1,109ms | 787ms | 320ms | 3.04s |
+| 2s reference, warm repeat | 366ms | 287ms | 3.6ms | 282ms | 2.72s |
+
+Speed check for `gpu_memory_utilization`:
+
+Method: keep `target_inflight=2`, `nanovllm_max_num_seqs=2`,
+`nanovllm_max_num_batched_tokens=2048`, and `nanovllm_max_model_len=1024`
+fixed; restart the service per value; warm no-reference and 2s-reference
+request shapes once; then measure median of three requests. Generation
+temperature was set to `0.01` to reduce output variance.
+
+| `gpu_memory_utilization` | tts-pool VRAM | No-ref generate | No-ref first chunk | Ref encode | Ref generate | Ref output audio |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.10 | 10,364 MiB | 377.1ms | 59.4ms | 4.1ms | 2,527.2ms | 28.64s |
+| 0.20 | 20,156 MiB | 377.0ms | 59.2ms | 4.2ms | 2,531.3ms | 28.64s |
+| 0.35 | 34,700 MiB | 377.9ms | 59.5ms | 4.3ms | 3,607.6ms | 40.96s |
+
+Interpretation: increasing `gpu_memory_utilization` did not improve warm
+single-request generation speed in this test. The slower absolute reference
+case at `0.35` produced proportionally longer audio; its generation
+real-time-factor is effectively the same. Keep `0.10` unless future concurrency
+or long-context tests show cache pressure.
+
+## NanoVLLM Warmup
+
+NanoVLLM-VoxCPM does not expose an `optimize=True` equivalent like the official
+VoxCPM2 backend. The useful optimization point is request-shape warmup: run a
+few short generations after model load so the first user request does not pay
+the cold generate/reference-encode cost.
+
+Implemented settings:
+
+- `nanovllm_warmup_enabled`
+- `nanovllm_warmup_cases`
+
+Default warmup cases, used when the setting is enabled without custom cases:
+
+1. short text, no reference audio
+2. short text, 2s synthetic reference audio, voice match
+3. short text, 2s synthetic reference audio, voice + pace match
+
+Each default case uses `temperature=0.01` and `max_generate_length=64` so warmup
+stays bounded. The shared `config/settings.json` default is still disabled;
+`dc2` enables it in `config/local.json`.
+
+### Fresh Startup A/B
+
+Measured on `dc2` on 2026-05-11 with the conservative config:
+`target_inflight=2`, `nanovllm_max_num_seqs=2`,
+`nanovllm_max_num_batched_tokens=2048`, `nanovllm_max_model_len=1024`,
+`nanovllm_gpu_memory_utilization=0.10`.
+
+Method: restart `tts-pool.service`, wait until `nanovllm_voxcpm` reports
+`loaded`, then send the same three requests sequentially. The reference request
+uses a 2s synthetic WAV. Request generation settings were `temperature=0.01`
+and `max_generate_length=64`.
+
+| Run | Usable after restart | Case | Wall | First chunk | Reference encode | Generate | Output audio |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| warmup off | 9.2s | no reference | 1,498ms | 590.0ms | n/a | 1,491.4ms | 10.24s |
+| warmup off | 9.2s | 2s reference, voice | 1,763ms | 77.2ms | 801.0ms | 949.0ms | 10.24s |
+| warmup off | 9.2s | 2s reference, voice + pace | 403ms | 62.7ms | 4.3ms | 394.3ms | 4.00s |
+| warmup on | 12.7s | no reference | 938ms | 60.7ms | n/a | 930.9ms | 10.24s |
+| warmup on | 12.7s | 2s reference, voice | 939ms | 59.5ms | 3.5ms | 930.3ms | 10.24s |
+| warmup on | 12.7s | 2s reference, voice + pace | 400ms | 59.8ms | 3.6ms | 391.4ms | 4.00s |
+
+Interpretation:
+
+- Startup-to-usable increased from 9.2s to 12.7s, so this warmup costs about
+  3.5s at service start.
+- The first no-reference request no longer pays the cold first-chunk penalty:
+  590.0ms dropped to 60.7ms.
+- The first reference request no longer pays the cold reference encoder cost:
+  801.0ms dropped to 3.5ms.
+- The third request is similar in both runs because the preceding reference
+  request already warmed the reference path in the warmup-off run.
+
+## Current App Routing
+
+The app repo local config is pointed to the dc2 TTS pool:
 
 ```json
 "tts_pool": {
-  "base_url": "http://127.0.0.1:8020",
+  "base_url": "http://dc2:8020",
   "timeout_s": 300
 }
 ```
 
-The app loads settings at import time, so the running app process on port `8003`
-must be restarted before this takes effect.
+The app loads settings at import time, so the running app process on port
+`8003` must be restarted after changing this value.
