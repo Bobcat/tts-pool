@@ -133,6 +133,8 @@ def model_definition_payload(model_settings: ModelSettings, *, resolved_backend:
                 "device": model_settings.device,
                 "voice_presets": dict(model_settings.voice_presets),
                 "kokoro_speed": model_settings.kokoro_speed,
+                "kokoro_warmup_enabled": model_settings.kokoro_warmup_enabled,
+                "kokoro_warmup_languages": list(model_settings.kokoro_warmup_languages),
             }
         )
     elif resolved_backend == "voxcpm2":

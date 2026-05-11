@@ -50,6 +50,8 @@ class ModelSettings:
     device: str | None = None
     voice_presets: dict[str, str] = field(default_factory=dict)
     kokoro_speed: float = 1.0
+    kokoro_warmup_enabled: bool = False
+    kokoro_warmup_languages: tuple[str, ...] = field(default_factory=tuple)
     voxcpm2_model_id: str = VOXCPM2_DEFAULT_MODEL_ID
     voxcpm2_load_denoiser: bool = False
     voxcpm2_optimize: bool = False
@@ -122,6 +124,8 @@ def load_settings(path: str | Path | None = None) -> AppSettings:
             device=_optional_str(model_payload.get("device")),
             voice_presets=_str_dict(model_payload.get("voice_presets")),
             kokoro_speed=max(0.25, float(model_payload.get("kokoro_speed", 1.0))),
+            kokoro_warmup_enabled=bool(model_payload.get("kokoro_warmup_enabled", False)),
+            kokoro_warmup_languages=_str_tuple(model_payload.get("kokoro_warmup_languages")),
             voxcpm2_model_id=str(model_payload.get("voxcpm2_model_id", VOXCPM2_DEFAULT_MODEL_ID) or "").strip()
             or VOXCPM2_DEFAULT_MODEL_ID,
             voxcpm2_load_denoiser=bool(model_payload.get("voxcpm2_load_denoiser", False)),
@@ -213,6 +217,24 @@ def _str_dict(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
     return {str(key): str(item) for key, item in value.items() if str(key).strip() and str(item).strip()}
+
+
+def _str_tuple(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        parsed = value.strip()
+        return (parsed,) if parsed else ()
+    if not isinstance(value, list):
+        return ()
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = str(item or "").strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        parsed.append(text)
+    return tuple(parsed)
 
 
 def _optional_str(value: Any) -> str | None:

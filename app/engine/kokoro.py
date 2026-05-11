@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 import wave
 from io import BytesIO
@@ -9,8 +10,10 @@ from typing import Any
 from app.config import ModelSettings
 from app.schemas import EngineResult
 from app.schemas import ResponseRequest
+from app.schemas import VoiceSpec
 
 
+LOGGER = logging.getLogger("tts_pool.kokoro")
 KOKORO_REPO_ID = "hexgrad/Kokoro-82M"
 KOKORO_SAMPLE_RATE_HZ = 24_000
 
@@ -73,6 +76,7 @@ class KokoroTTSRuntime:
 
     def load(self) -> None:
         self._model_instance()
+        self._warmup()
 
     def close(self) -> None:
         self._pipelines = {}
@@ -253,6 +257,58 @@ class KokoroTTSRuntime:
             return requested
         return self.model_settings.voice_presets.get(str(request.language or "").strip())
 
+    def _warmup(self) -> None:
+        if not self.model_settings.kokoro_warmup_enabled:
+            return
+        languages = _warmup_languages(self.model_settings)
+        if not languages:
+            return
+        started_at = time.perf_counter()
+        LOGGER.info("Kokoro warmup started model=%s languages=%s", self.model_name, len(languages))
+        completed = 0
+        for language in languages:
+            try:
+                _lang_code(language)
+            except ValueError:
+                LOGGER.warning("Kokoro warmup skipped unsupported language=%s", language)
+                continue
+            case_started_at = time.perf_counter()
+            voice = _voice_preset_for_language(self.model_settings, language)
+            try:
+                result = self.synthesize(
+                    ResponseRequest(
+                        model=self.model_name,
+                        input=_warmup_text(language),
+                        language=language,
+                        voice=VoiceSpec(preset=voice),
+                        generation={"kokoro": {"speed": self.model_settings.kokoro_speed}},
+                    )
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "Kokoro warmup case failed model=%s language=%s error=%s",
+                    self.model_name,
+                    language,
+                    exc,
+                )
+                continue
+            completed += 1
+            LOGGER.info(
+                "Kokoro warmup case completed model=%s index=%s/%s language=%s voice=%s wall_ms=%.1f",
+                self.model_name,
+                completed,
+                len(languages),
+                language,
+                result.metadata.get("voice"),
+                (time.perf_counter() - case_started_at) * 1000.0,
+            )
+        LOGGER.info(
+            "Kokoro warmup completed model=%s cases=%s wall_ms=%.1f",
+            self.model_name,
+            completed,
+            (time.perf_counter() - started_at) * 1000.0,
+        )
+
 
 def _lang_code(language: str) -> str:
     key = str(language or "").strip().lower().replace("_", "-")
@@ -274,6 +330,54 @@ def _voice_name(lang_code: str, voice: str | None) -> str:
     if not voice_name.startswith(lang_code):
         raise ValueError(f"Kokoro voice {voice_name!r} does not match language pipeline {lang_code!r}")
     return voice_name
+
+
+def _warmup_languages(model_settings: ModelSettings) -> tuple[str, ...]:
+    candidates = model_settings.kokoro_warmup_languages or tuple(model_settings.voice_presets) or ("English",)
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        language = str(candidate or "").strip()
+        key = language.lower()
+        if not language or key in seen:
+            continue
+        seen.add(key)
+        out.append(language)
+    return tuple(out)
+
+
+def _voice_preset_for_language(model_settings: ModelSettings, language: str) -> str | None:
+    text = str(language or "").strip()
+    if text in model_settings.voice_presets:
+        return model_settings.voice_presets[text]
+    folded = text.lower()
+    for candidate, voice in model_settings.voice_presets.items():
+        if str(candidate or "").strip().lower() == folded:
+            return voice
+    return None
+
+
+def _warmup_text(language: str) -> str:
+    key = str(language or "").strip().lower().replace("_", "-")
+    return {
+        "chinese": "准备好了。",
+        "zh": "准备好了。",
+        "zh-cn": "准备好了。",
+        "japanese": "準備できました。",
+        "ja": "準備できました。",
+        "ja-jp": "準備できました。",
+        "french": "Pret.",
+        "fr": "Pret.",
+        "spanish": "Listo.",
+        "es": "Listo.",
+        "italian": "Pronto.",
+        "it": "Pronto.",
+        "portuguese": "Pronto.",
+        "pt": "Pronto.",
+        "brazilian portuguese": "Pronto.",
+        "hindi": "Taiyar hai.",
+        "hi": "Taiyar hai.",
+    }.get(key, "Ready.")
 
 
 def _model_device_name(model: Any, configured_device: str | None) -> str:

@@ -103,6 +103,71 @@ class KokoroRuntimeTests(unittest.TestCase):
                     )
                 )
 
+    def test_load_warms_configured_languages_and_voices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_root = Path(tmpdir)
+            voices_dir = model_root / "voices"
+            voices_dir.mkdir()
+            (voices_dir / "af_heart.pt").write_bytes(b"voice")
+            (voices_dir / "bf_emma.pt").write_bytes(b"voice")
+            english_pipeline = FakePipeline()
+            british_pipeline = FakePipeline()
+            runtime = KokoroTTSRuntime(
+                model_name="kokoro",
+                model_settings=ModelSettings(
+                    backend="kokoro",
+                    model_path=str(model_root),
+                    kokoro_speed=1.0,
+                    kokoro_warmup_enabled=True,
+                    voice_presets={
+                        "English": "af_heart",
+                        "British English": "bf_emma",
+                    },
+                ),
+            )
+            runtime._model = FakeModel()
+            runtime._pipelines["a"] = english_pipeline
+            runtime._pipelines["b"] = british_pipeline
+
+            runtime.load()
+
+        self.assertEqual(english_pipeline.calls[0]["text"], "Ready.")
+        self.assertEqual(english_pipeline.calls[0]["voice"], str(voices_dir / "af_heart.pt"))
+        self.assertEqual(british_pipeline.calls[0]["text"], "Ready.")
+        self.assertEqual(british_pipeline.calls[0]["voice"], str(voices_dir / "bf_emma.pt"))
+
+    def test_load_respects_kokoro_warmup_language_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_root = Path(tmpdir)
+            voices_dir = model_root / "voices"
+            voices_dir.mkdir()
+            (voices_dir / "af_heart.pt").write_bytes(b"voice")
+            (voices_dir / "bf_emma.pt").write_bytes(b"voice")
+            english_pipeline = FakePipeline()
+            british_pipeline = FakePipeline()
+            runtime = KokoroTTSRuntime(
+                model_name="kokoro",
+                model_settings=ModelSettings(
+                    backend="kokoro",
+                    model_path=str(model_root),
+                    kokoro_speed=1.0,
+                    kokoro_warmup_enabled=True,
+                    kokoro_warmup_languages=("British English",),
+                    voice_presets={
+                        "English": "af_heart",
+                        "British English": "bf_emma",
+                    },
+                ),
+            )
+            runtime._model = FakeModel()
+            runtime._pipelines["a"] = english_pipeline
+            runtime._pipelines["b"] = british_pipeline
+
+            runtime.load()
+
+        self.assertEqual(english_pipeline.calls, [])
+        self.assertEqual(british_pipeline.calls[0]["voice"], str(voices_dir / "bf_emma.pt"))
+
 
 if __name__ == "__main__":
     unittest.main()

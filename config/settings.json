@@ -5,7 +5,7 @@
     "log_level": "info"
   },
   "engine": {
-    "backend": "voxcpm2",
+    "backend": "nanovllm_voxcpm",
     "models": {
       "stub-tts": {
         "backend": "stub",
@@ -15,9 +15,11 @@
       "kokoro": {
         "backend": "kokoro",
         "model_path": "/home/gunnar/models/kokoro",
-        "enabled": false,
+        "enabled": true,
         "target_inflight": 1,
         "kokoro_speed": 1.0,
+        "kokoro_warmup_enabled": true,
+        "kokoro_warmup_languages": ["English", "British English"],
         "voice_presets": {
           "English": "af_heart",
           "British English": "bf_emma",
@@ -33,7 +35,7 @@
       },
       "voxcpm2": {
         "backend": "voxcpm2",
-        "enabled": true,
+        "enabled": false,
         "target_inflight": 1,
         "voxcpm2_model_id": "openbmb/VoxCPM2",
         "voxcpm2_load_denoiser": false,
@@ -47,7 +49,7 @@
       },
       "nanovllm_voxcpm": {
         "backend": "nanovllm_voxcpm",
-        "enabled": false,
+        "enabled": true,
         "target_inflight": 4,
         "nanovllm_model_id": "openbmb/VoxCPM2",
         "nanovllm_devices": [0],

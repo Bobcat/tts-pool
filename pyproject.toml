@@ -13,11 +13,11 @@ dependencies = [
   "uvicorn>=0.30",
   "pydantic>=2.6",
   "voxcpm==2.0.2",
+  "kokoro>=0.9.2",
 ]
 
 [project.optional-dependencies]
 kokoro = [
-  "kokoro>=0.9.2",
   "misaki[ja,zh]>=0.9.4",
   "numpy>=1.26",
 ]

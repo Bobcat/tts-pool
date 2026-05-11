@@ -111,6 +111,32 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(warmup_case.cfg_value, 1.5)
         self.assertEqual(warmup_case.inference_timesteps, 6)
 
+    def test_kokoro_warmup_settings_are_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "settings.json"
+            settings_path.write_text(
+                (
+                    "{\n"
+                    '  "engine": {\n'
+                    '    "models": {\n'
+                    '      "kokoro": {\n'
+                    '        "backend": "kokoro",\n'
+                    '        "kokoro_warmup_enabled": true,\n'
+                    '        "kokoro_warmup_languages": ["English", "Chinese", "English"]\n'
+                    "      }\n"
+                    "    }\n"
+                    "  }\n"
+                    "}\n"
+                ),
+                encoding="utf-8",
+            )
+
+            settings = load_settings(settings_path)
+
+        model_settings = settings.engine.models["kokoro"]
+        self.assertTrue(model_settings.kokoro_warmup_enabled)
+        self.assertEqual(model_settings.kokoro_warmup_languages, ("English", "Chinese"))
+
     def test_nanovllm_model_settings_are_loaded(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings_path = Path(tmpdir) / "settings.json"
