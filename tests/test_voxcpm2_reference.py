@@ -55,18 +55,25 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
                 model="voxcpm2",
                 input="Hallo wereld",
                 language="Dutch",
-                voice=VoiceSpec(preset="configured", reference_audio=reference),
+                voice=VoiceSpec(
+                    instructions=(
+                        "Speak in Dutch. Pronounce numbers, abbreviations, and short fragments in Dutch. "
+                        "Match the speaking pace, rhythm, and articulation of the reference audio."
+                    ),
+                    reference_audio=reference,
+                ),
             )
         )
 
         self.assertEqual(result.metadata["reference_source_duration_ms"], 2000)
         self.assertTrue(result.metadata["reference_clipped"])
         self.assertLessEqual(result.metadata["reference_duration_ms"], 1000)
-        self.assertEqual(result.metadata["reference_audio_match"], "voice_and_pace")
         self.assertIsNotNone(model.generate_kwargs["reference_wav_path"])
+        self.assertIn("Speak in Dutch", model.generate_kwargs["text"])
+        self.assertIn("Pronounce numbers", model.generate_kwargs["text"])
         self.assertIn("Match the speaking pace", model.generate_kwargs["text"])
 
-    def test_reference_audio_can_skip_pace_control_prompt(self) -> None:
+    def test_reference_audio_does_not_add_implicit_pace_prompt(self) -> None:
         model = FakeVoxCPM()
         runtime = VoxCPM2TTSRuntime(
             model_name="voxcpm2",
@@ -85,18 +92,17 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
                 input="Hallo wereld",
                 language="Dutch",
                 voice=VoiceSpec(
-                    preset="configured",
+                    instructions="Speak in Dutch.",
                     reference_audio=reference,
-                    reference_audio_match="voice",
                 ),
             )
         )
 
-        self.assertEqual(result.metadata["reference_audio_match"], "voice")
         self.assertIsNotNone(model.generate_kwargs["reference_wav_path"])
+        self.assertIn("Speak in Dutch", model.generate_kwargs["text"])
         self.assertNotIn("Match the speaking pace", model.generate_kwargs["text"])
 
-    def test_unknown_voice_preset_is_rejected(self) -> None:
+    def test_voice_preset_is_rejected(self) -> None:
         runtime = VoxCPM2TTSRuntime(
             model_name="voxcpm2",
             model_settings=ModelSettings(backend="voxcpm2"),
@@ -109,7 +115,7 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
                     model="voxcpm2",
                     input="Hallo wereld",
                     language="Dutch",
-                    voice=VoiceSpec(preset="missing"),
+                    voice=VoiceSpec(preset="configured"),
                 )
             )
 
@@ -140,7 +146,6 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
         self.assertEqual({4, 6, 10}, {call["inference_timesteps"] for call in model.generate_calls})
         self.assertTrue(any(call["reference_wav_path"] is None for call in model.generate_calls))
         self.assertTrue(any(call["reference_wav_path"] is not None for call in model.generate_calls))
-        self.assertTrue(any("Match the speaking pace" in call["text"] for call in model.generate_calls))
 
     def test_load_runs_configured_warmup_cases(self) -> None:
         model = FakeVoxCPM()
@@ -154,7 +159,6 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
                         name="custom",
                         text="Custom warmup",
                         reference_audio=True,
-                        reference_audio_match="voice_and_pace",
                         cfg_value=1.5,
                         inference_timesteps=6,
                     ),
@@ -170,7 +174,6 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
         self.assertEqual(model.generate_kwargs["inference_timesteps"], 6)
         self.assertIsNotNone(model.generate_kwargs["reference_wav_path"])
         self.assertIn("Custom warmup", model.generate_kwargs["text"])
-        self.assertIn("Match the speaking pace", model.generate_kwargs["text"])
 
 
 def _silent_wav(*, seconds: float, sample_rate_hz: int = 16000) -> bytes:

@@ -22,8 +22,7 @@ contract.
   "input": "Let's see if this works.",
   "language": "English",
   "voice": {
-    "preset": "warm_female",
-    "instructions": "Use natural intonation.",
+    "instructions": "Speak in English. Use natural intonation.",
     "reference_audio": {
       "mime_type": "audio/wav",
       "data_base64": "...",
@@ -47,3 +46,7 @@ contract.
 
 `stream: true` is intentionally rejected in the first version. The response
 contains base64 WAV audio so callers can stay stateless and remote-friendly.
+
+For VoxCPM-family backends, clients own prompt wording and send the final text
+control through `voice.instructions`. `voice.preset` is only meaningful for
+backends with native voice ids, such as Kokoro.

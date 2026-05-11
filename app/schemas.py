@@ -19,7 +19,6 @@ class VoiceSpec(BaseModel):
     preset: str | None = None
     instructions: str | None = None
     reference_audio: ReferenceAudio | None = None
-    reference_audio_match: Literal["voice", "voice_and_pace"] = "voice_and_pace"
 
 
 class AudioFormat(BaseModel):

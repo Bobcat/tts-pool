@@ -43,11 +43,7 @@
         "voxcpm2_normalize": false,
         "voxcpm2_denoise": false,
         "voxcpm2_reference_max_duration_s": 8.0,
-        "voxcpm2_warmup_enabled": true,
-        "voice_presets": {
-          "Dutch": "configured",
-          "English": "configured"
-        }
+        "voxcpm2_warmup_enabled": true
       },
       "nanovllm_voxcpm": {
         "backend": "nanovllm_voxcpm",
@@ -65,11 +61,7 @@
         "nanovllm_cfg_value": 2.0,
         "nanovllm_reference_max_duration_s": 8.0,
         "nanovllm_warmup_enabled": false,
-        "nanovllm_warmup_cases": [],
-        "voice_presets": {
-          "Dutch": "configured",
-          "English": "configured"
-        }
+        "nanovllm_warmup_cases": []
       }
     }
   }

@@ -203,9 +203,7 @@ Custom cases can be set with `voxcpm2_warmup_cases`:
             "name": "medium_ref_6",
             "text": "Let's see if this works clearly enough for live translation.",
             "reference_audio": true,
-            "reference_audio_match": "voice_and_pace",
             "reference_duration_s": 4.0,
-            "voice_preset": "configured",
             "cfg_value": 2.0,
             "inference_timesteps": 6
           }
@@ -222,16 +220,13 @@ Warmup should be shape-based, not language-based:
 - short text with reference audio;
 - medium text with reference audio;
 - longer text with reference audio;
-- each `inference_timesteps` value we expose or use, likely `10`, `6`, and `4`;
-- the prompt/control modes we actually use:
-  - `preset=configured`;
-  - optional voice description preset;
-  - `reference_audio_match=voice`;
-  - `reference_audio_match=voice_and_pace` if used by clients.
+- each `inference_timesteps` value we expose or use, likely `10`, `6`, and `4`.
 
-Language-specific warmup is only useful if the effective control prompt or text
-shape differs enough to compile a new path. With the current integration, text
-length/tokenization matters more than the `language` metadata field.
+Clients own prompt wording and pass the final VoxCPM control text through
+`voice.instructions`. Language-specific warmup is only useful if the effective
+control prompt or text shape differs enough to compile a new path. With the
+current integration, text length/tokenization matters more than the `language`
+metadata field.
 
 Current implementation:
 

@@ -18,9 +18,7 @@ class VoxCPM2WarmupCase:
     name: str = ""
     text: str = "Let's see if this works."
     reference_audio: bool = False
-    reference_audio_match: str = "voice"
     reference_duration_s: float = 4.0
-    voice_preset: str = "configured"
     cfg_value: float | None = None
     inference_timesteps: int | None = None
 
@@ -30,9 +28,7 @@ class NanoVLLMWarmupCase:
     name: str = ""
     text: str = "Let's see if this works."
     reference_audio: bool = False
-    reference_audio_match: str = "voice"
     reference_duration_s: float = 2.0
-    voice_preset: str = "configured"
     cfg_value: float | None = None
     temperature: float | None = None
     max_generate_length: int | None = None
@@ -261,11 +257,7 @@ def _voxcpm2_warmup_cases(value: Any) -> tuple[VoxCPM2WarmupCase, ...]:
                 text=str(payload.get("text", "Let's see if this works.") or "").strip()
                 or "Let's see if this works.",
                 reference_audio=bool(payload.get("reference_audio", False)),
-                reference_audio_match=str(payload.get("reference_audio_match", "voice") or "voice").strip()
-                or "voice",
                 reference_duration_s=_bounded_float(payload.get("reference_duration_s", 4.0), minimum=0.2, maximum=60.0),
-                voice_preset=str(payload.get("voice_preset", "configured") or "configured").strip()
-                or "configured",
                 cfg_value=None if cfg_value is None else max(0.1, float(cfg_value)),
                 inference_timesteps=None if inference_timesteps is None else max(1, int(inference_timesteps)),
             )
@@ -290,11 +282,7 @@ def _nanovllm_warmup_cases(value: Any) -> tuple[NanoVLLMWarmupCase, ...]:
                 text=str(payload.get("text", "Let's see if this works.") or "").strip()
                 or "Let's see if this works.",
                 reference_audio=bool(payload.get("reference_audio", False)),
-                reference_audio_match=str(payload.get("reference_audio_match", "voice") or "voice").strip()
-                or "voice",
                 reference_duration_s=_bounded_float(payload.get("reference_duration_s", 2.0), minimum=0.2, maximum=60.0),
-                voice_preset=str(payload.get("voice_preset", "configured") or "configured").strip()
-                or "configured",
                 cfg_value=None if cfg_value is None else max(0.1, float(cfg_value)),
                 temperature=None if temperature is None else _bounded_float(temperature, minimum=0.01, maximum=5.0),
                 max_generate_length=None if max_generate_length is None else max(1, int(max_generate_length)),

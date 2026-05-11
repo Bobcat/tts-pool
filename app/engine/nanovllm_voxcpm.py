@@ -14,14 +14,11 @@ from app.schemas import EngineResult
 from app.schemas import ResponseRequest
 
 from .common import decode_reference_audio
-from .voxcpm2 import _append_unique
 from .voxcpm2 import _copy_wav_tail
 from .voxcpm2 import _voxcpm2_text
 from .voxcpm2 import _wav_bytes
 from .voxcpm2 import _wav_duration_ms
 from .voxcpm2 import _write_warmup_reference_wav
-from .voxcpm2 import REFERENCE_CONTROL
-from .voxcpm2 import VOICE_PRESETS
 
 
 LOGGER = logging.getLogger("tts_pool.engine.nanovllm_voxcpm")
@@ -37,16 +34,6 @@ DEFAULT_WARMUP_CASES = (
         name="short_ref_voice",
         text="Let's see if this works.",
         reference_audio=True,
-        reference_audio_match="voice",
-        reference_duration_s=2.0,
-        temperature=0.01,
-        max_generate_length=64,
-    ),
-    NanoVLLMWarmupCase(
-        name="short_ref_voice_and_pace",
-        text="Let's see if this works.",
-        reference_audio=True,
-        reference_audio_match="voice_and_pace",
         reference_duration_s=2.0,
         temperature=0.01,
         max_generate_length=64,
@@ -225,18 +212,10 @@ class NanoVLLMVoxCPMTTSRuntime:
         )
 
     def _control_for_request(self, request: ResponseRequest) -> str:
-        fragments: list[str] = []
         preset = str(request.voice.preset or "").strip()
-        if not preset:
-            preset = self.model_settings.voice_presets.get(str(request.language or "").strip(), "configured")
         if preset:
-            if preset not in VOICE_PRESETS:
-                raise ValueError(f"unsupported nanovllm_voxcpm voice preset: {preset}")
-            _append_unique(fragments, VOICE_PRESETS[preset])
-        _append_unique(fragments, str(request.voice.instructions or "").strip())
-        if request.voice.reference_audio is not None and request.voice.reference_audio_match == "voice_and_pace":
-            _append_unique(fragments, REFERENCE_CONTROL)
-        return " ".join(fragments).strip()
+            raise ValueError("voice.preset is unsupported for nanovllm_voxcpm; send voice.instructions")
+        return str(request.voice.instructions or "").strip()
 
     def _reference_wav(self, request: ResponseRequest) -> tuple[bytes | None, dict[str, Any]]:
         reference_audio = request.voice.reference_audio
@@ -255,7 +234,6 @@ class NanoVLLMVoxCPMTTSRuntime:
             metadata: dict[str, Any] = {
                 "reference_audio": True,
                 "reference_mime_type": reference_audio.mime_type,
-                "reference_audio_match": request.voice.reference_audio_match,
                 "reference_max_duration_s": max_duration_s,
                 "reference_source_duration_ms": original_duration_ms,
             }
@@ -310,7 +288,7 @@ class NanoVLLMVoxCPMTTSRuntime:
                 generate_started = time.perf_counter()
                 chunks = 0
                 async for _chunk in server.generate(
-                    target_text=_voxcpm2_text(case.text, _control_for_warmup_case(case)),
+                    target_text=_voxcpm2_text(case.text, ""),
                     max_generate_length=max_generate_length,
                     temperature=temperature,
                     cfg_value=cfg_value,
@@ -320,14 +298,13 @@ class NanoVLLMVoxCPMTTSRuntime:
                 generate_ms = (time.perf_counter() - generate_started) * 1000.0
                 LOGGER.info(
                     "NanoVLLM VoxCPM warmup case completed model=%s index=%s/%s name=%s "
-                    "reference_audio=%s reference_audio_match=%s temperature=%.3f "
+                    "reference_audio=%s temperature=%.3f "
                     "max_generate_length=%s reference_encode_ms=%.1f generate_ms=%.1f chunks=%s",
                     self.model_name,
                     index,
                     len(cases),
                     case.name or f"case_{index}",
                     case.reference_audio,
-                    case.reference_audio_match,
                     temperature,
                     max_generate_length,
                     reference_encode_ms,
@@ -395,17 +372,3 @@ def _model_info_dict(model_info: Any) -> dict[str, Any]:
     if hasattr(model_info, "_asdict"):
         return dict(model_info._asdict())
     return dict(getattr(model_info, "__dict__", {}))
-
-
-def _control_for_warmup_case(case: NanoVLLMWarmupCase) -> str:
-    fragments: list[str] = []
-    preset = str(case.voice_preset or "configured").strip() or "configured"
-    if preset not in VOICE_PRESETS:
-        raise ValueError(f"unsupported nanovllm_voxcpm warmup voice preset: {preset}")
-    _append_unique(fragments, VOICE_PRESETS[preset])
-    reference_match = str(case.reference_audio_match or "voice").strip() or "voice"
-    if reference_match not in {"voice", "voice_and_pace"}:
-        raise ValueError(f"unsupported nanovllm_voxcpm warmup reference_audio_match: {reference_match}")
-    if case.reference_audio and reference_match == "voice_and_pace":
-        _append_unique(fragments, REFERENCE_CONTROL)
-    return " ".join(fragments).strip()

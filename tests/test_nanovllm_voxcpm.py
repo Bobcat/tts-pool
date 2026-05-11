@@ -60,13 +60,15 @@ class NanoVLLMVoxCPMTests(unittest.TestCase):
                 input="Hallo wereld",
                 language="Dutch",
                 voice=VoiceSpec(
-                    preset="configured",
+                    instructions=(
+                        "Speak in Dutch. Pronounce numbers, abbreviations, and short fragments in Dutch. "
+                        "Match the speaking pace, rhythm, and articulation of the reference audio."
+                    ),
                     reference_audio=ReferenceAudio(
                         mime_type="audio/wav",
                         data_base64=base64.b64encode(_silent_wav(seconds=2.0)).decode("ascii"),
                         max_duration_s=1.0,
                     ),
-                    reference_audio_match="voice_and_pace",
                 ),
             )
         )
@@ -76,10 +78,31 @@ class NanoVLLMVoxCPMTests(unittest.TestCase):
         self.assertEqual(result.duration_ms, 100)
         self.assertEqual(result.metadata["engine"], "nanovllm_voxcpm")
         self.assertTrue(result.metadata["reference_clipped"])
-        self.assertEqual(result.metadata["reference_audio_match"], "voice_and_pace")
         self.assertLessEqual(_wav_duration_ms(server.encoded_wav or b""), 1000)
         self.assertEqual(server.generate_kwargs["ref_audio_latents"], b"latents-1")
+        self.assertIn("Speak in Dutch", server.generate_kwargs["target_text"])
+        self.assertIn("Pronounce numbers", server.generate_kwargs["target_text"])
         self.assertIn("Match the speaking pace", server.generate_kwargs["target_text"])
+
+    def test_voice_preset_is_rejected(self) -> None:
+        runtime = NanoVLLMVoxCPMTTSRuntime(
+            model_name="nanovllm_voxcpm",
+            model_settings=ModelSettings(backend="nanovllm_voxcpm"),
+        )
+        runtime._start_loop()
+        runtime._server = FakeNanoServer()
+        runtime._model_info = {"sample_rate": 16000}
+        self.addCleanup(runtime.close)
+
+        with self.assertRaises(ValueError):
+            runtime.synthesize(
+                ResponseRequest(
+                    model="nanovllm_voxcpm",
+                    input="Hallo wereld",
+                    language="Dutch",
+                    voice=VoiceSpec(preset="configured"),
+                )
+            )
 
     def test_warmup_runs_configured_cases(self) -> None:
         server = FakeNanoServer()
@@ -100,7 +123,6 @@ class NanoVLLMVoxCPMTests(unittest.TestCase):
                         name="ref_pace",
                         text="Warm reference.",
                         reference_audio=True,
-                        reference_audio_match="voice_and_pace",
                         reference_duration_s=0.5,
                         temperature=0.02,
                         max_generate_length=32,
@@ -122,7 +144,6 @@ class NanoVLLMVoxCPMTests(unittest.TestCase):
         self.assertEqual(server.generate_calls[1]["ref_audio_latents"], b"latents-1")
         self.assertEqual(server.generate_calls[1]["temperature"], 0.02)
         self.assertEqual(server.generate_calls[1]["max_generate_length"], 32)
-        self.assertIn("Match the speaking pace", server.generate_calls[1]["target_text"])
         self.assertLessEqual(_wav_duration_ms(server.encoded_wavs[0]), 500)
 
 

@@ -126,12 +126,12 @@ def model_definition_payload(model_settings: ModelSettings, *, resolved_backend:
         "model_path": model_settings.model_path,
         "enabled": model_settings.enabled,
         "target_inflight": model_settings.target_inflight,
-        "voice_presets": dict(model_settings.voice_presets),
     }
     if resolved_backend == "kokoro":
         payload.update(
             {
                 "device": model_settings.device,
+                "voice_presets": dict(model_settings.voice_presets),
                 "kokoro_speed": model_settings.kokoro_speed,
             }
         )
@@ -242,12 +242,11 @@ def capabilities_for_backend(backend: str, model_settings: ModelSettings) -> dic
         return {
             "languages": _voxcpm2_languages(),
             "output_formats": ["wav"],
-            "voice_presets": True,
+            "voice_presets": False,
             "voice_instructions": True,
             "reference_audio": True,
             "reference_audio_mime_types": ["audio/wav"],
             "reference_audio_max_duration_s": model_settings.voxcpm2_reference_max_duration_s,
-            "reference_audio_match": ["voice", "voice_and_pace"],
             "request_generation": {
                 "voxcpm2.cfg_value": {"kind": "number", "minimum": 0.1, "maximum": 10.0, "default": model_settings.voxcpm2_cfg_value},
                 "voxcpm2.inference_timesteps": {
@@ -265,12 +264,11 @@ def capabilities_for_backend(backend: str, model_settings: ModelSettings) -> dic
         return {
             "languages": _voxcpm2_languages(),
             "output_formats": ["wav"],
-            "voice_presets": True,
+            "voice_presets": False,
             "voice_instructions": True,
             "reference_audio": True,
             "reference_audio_mime_types": ["audio/wav"],
             "reference_audio_max_duration_s": model_settings.nanovllm_reference_max_duration_s,
-            "reference_audio_match": ["voice", "voice_and_pace"],
             "request_generation": {
                 "nanovllm_voxcpm.cfg_value": {"kind": "number", "minimum": 0.1, "maximum": 10.0, "default": model_settings.nanovllm_cfg_value},
                 "nanovllm_voxcpm.temperature": {

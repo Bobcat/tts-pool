@@ -20,14 +20,6 @@ from .common import decode_reference_audio
 
 LOGGER = logging.getLogger("tts_pool.engine.voxcpm2")
 
-VOICE_PRESETS = {
-    "configured": "",
-    "neutral_clear": "Use a clear, neutral adult voice with steady articulation.",
-    "warm_female": "Use a warm adult female voice with natural intonation.",
-    "calm_male": "Use a calm adult male voice with measured delivery.",
-    "focused_narrator": "Use a focused narrator voice with crisp diction.",
-}
-REFERENCE_CONTROL = "Match the speaking pace, rhythm, and articulation of the reference audio."
 DEFAULT_WARMUP_CASES = (
     VoxCPM2WarmupCase(
         name="short_no_ref_10",
@@ -36,31 +28,27 @@ DEFAULT_WARMUP_CASES = (
         inference_timesteps=10,
     ),
     VoxCPM2WarmupCase(
-        name="short_ref_voice_10",
+        name="short_ref_10",
         text="Let's see if this works.",
         reference_audio=True,
-        reference_audio_match="voice",
         inference_timesteps=10,
     ),
     VoxCPM2WarmupCase(
-        name="medium_ref_voice_and_pace_10",
+        name="medium_ref_10",
         text="Let's see if this works clearly enough for live translation.",
         reference_audio=True,
-        reference_audio_match="voice_and_pace",
         inference_timesteps=10,
     ),
     VoxCPM2WarmupCase(
-        name="medium_ref_voice_and_pace_6",
+        name="medium_ref_6",
         text="Let's see if this works clearly enough for live translation.",
         reference_audio=True,
-        reference_audio_match="voice_and_pace",
         inference_timesteps=6,
     ),
     VoxCPM2WarmupCase(
-        name="medium_ref_voice_and_pace_4",
+        name="medium_ref_4",
         text="Let's see if this works clearly enough for live translation.",
         reference_audio=True,
-        reference_audio_match="voice_and_pace",
         inference_timesteps=4,
     ),
 )
@@ -171,18 +159,10 @@ class VoxCPM2TTSRuntime:
         return self._model
 
     def _control_for_request(self, request: ResponseRequest) -> str:
-        fragments: list[str] = []
         preset = str(request.voice.preset or "").strip()
-        if not preset:
-            preset = self.model_settings.voice_presets.get(str(request.language or "").strip(), "configured")
         if preset:
-            if preset not in VOICE_PRESETS:
-                raise ValueError(f"unsupported voxcpm2 voice preset: {preset}")
-            _append_unique(fragments, VOICE_PRESETS[preset])
-        _append_unique(fragments, str(request.voice.instructions or "").strip())
-        if request.voice.reference_audio is not None and request.voice.reference_audio_match == "voice_and_pace":
-            _append_unique(fragments, REFERENCE_CONTROL)
-        return " ".join(fragments).strip()
+            raise ValueError("voice.preset is unsupported for voxcpm2; send voice.instructions")
+        return str(request.voice.instructions or "").strip()
 
     def _reference_path(self, request: ResponseRequest, tmpdir: Path) -> tuple[Path | None, dict[str, Any]]:
         reference_audio = request.voice.reference_audio
@@ -199,7 +179,6 @@ class VoxCPM2TTSRuntime:
         metadata: dict[str, Any] = {
             "reference_audio": True,
             "reference_mime_type": reference_audio.mime_type,
-            "reference_audio_match": request.voice.reference_audio_match,
             "reference_max_duration_s": max_duration_s,
             "reference_source_duration_ms": original_duration_ms,
         }
@@ -242,7 +221,7 @@ class VoxCPM2TTSRuntime:
                 )
                 case_started = time.perf_counter()
                 model.generate(
-                    text=_voxcpm2_text(case.text, _control_for_warmup_case(case)),
+                    text=_voxcpm2_text(case.text, ""),
                     reference_wav_path=str(reference_path) if reference_path is not None else None,
                     cfg_value=cfg_value,
                     inference_timesteps=inference_timesteps,
@@ -251,13 +230,12 @@ class VoxCPM2TTSRuntime:
                 )
                 LOGGER.info(
                     "VoxCPM2 warmup case completed model=%s index=%s/%s name=%s reference_audio=%s "
-                    "reference_audio_match=%s inference_timesteps=%s wall_ms=%.1f",
+                    "inference_timesteps=%s wall_ms=%.1f",
                     self.model_name,
                     index,
                     len(cases),
                     case.name or f"case_{index}",
                     case.reference_audio,
-                    case.reference_audio_match,
                     inference_timesteps,
                     (time.perf_counter() - case_started) * 1000.0,
                 )
@@ -269,32 +247,12 @@ class VoxCPM2TTSRuntime:
         )
 
 
-def _append_unique(items: list[str], value: str) -> None:
-    clean = str(value or "").strip()
-    if clean and clean not in items:
-        items.append(clean)
-
-
 def _voxcpm2_text(text: str, control: str) -> str:
     safe_text = str(text or "").strip()
     safe_control = str(control or "").strip()
     if safe_control:
         return f"({safe_control}){safe_text}"
     return safe_text
-
-
-def _control_for_warmup_case(case: VoxCPM2WarmupCase) -> str:
-    fragments: list[str] = []
-    preset = str(case.voice_preset or "configured").strip() or "configured"
-    if preset not in VOICE_PRESETS:
-        raise ValueError(f"unsupported voxcpm2 warmup voice preset: {preset}")
-    _append_unique(fragments, VOICE_PRESETS[preset])
-    reference_match = str(case.reference_audio_match or "voice").strip() or "voice"
-    if reference_match not in {"voice", "voice_and_pace"}:
-        raise ValueError(f"unsupported voxcpm2 warmup reference_audio_match: {reference_match}")
-    if case.reference_audio and reference_match == "voice_and_pace":
-        _append_unique(fragments, REFERENCE_CONTROL)
-    return " ".join(fragments).strip()
 
 
 def _write_warmup_reference_wav(path: Path, *, duration_s: float, sample_rate_hz: int = 16000) -> None:
