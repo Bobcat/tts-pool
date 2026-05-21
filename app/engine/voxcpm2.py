@@ -73,6 +73,14 @@ class VoxCPM2TTSRuntime:
         started_at = time.perf_counter()
         model = self._model_instance()
         control = self._control_for_request(request)
+        # In ultimate-cloning mode the (control)-prefix is no longer
+        # the first thing in the model's tokenized input (prompt_text
+        # comes before it), so VoxCPM2 reads it as literal speech and
+        # narrates "(Speak in Swedish.)" before the target. Drop the
+        # control wrapper here — voice and language are anchored by the
+        # paired prompt audio + transcript anyway.
+        if _prompt_text_for_request(request):
+            control = ""
         text = _voxcpm2_text(request.input, control)
         with tempfile.TemporaryDirectory(prefix="tts-pool-voxcpm2-ref-") as tmpdir:
             reference_path, reference_metadata = self._reference_path(request, Path(tmpdir))
@@ -97,15 +105,39 @@ class VoxCPM2TTSRuntime:
                 if generation.denoise is None
                 else bool(generation.denoise)
             )
-            generate_started = time.perf_counter()
-            wav = model.generate(
-                text=text,
-                reference_wav_path=str(reference_path) if reference_path is not None else None,
-                cfg_value=cfg_value,
-                inference_timesteps=inference_timesteps,
-                normalize=normalize,
-                denoise=denoise,
+            # Ultimate-cloning when the request pairs the reference WAV
+            # with a transcript. Two sub-modes:
+            #   UC2 (default): same WAV passed as both prompt and
+            #        reference — the "for better similarity" recipe
+            #        from the VoxCPM2 docs.
+            #   UC1: prompt-only — reference_wav_path dropped, keeping
+            #        only the audio-continuation pair. Set via
+            #        reference_audio.also_use_as_reference = False.
+            # Reference-only mode applies when no prompt_text is set.
+            prompt_text = _prompt_text_for_request(request)
+            ultimate_use_reference = (
+                prompt_text is not None
+                and _ultimate_use_reference_for_request(request)
             )
+            reference_metadata["ultimate_cloning"] = bool(prompt_text)
+            reference_metadata["ultimate_cloning_with_reference"] = bool(ultimate_use_reference)
+            generate_kwargs: dict[str, Any] = {
+                "text": text,
+                "cfg_value": cfg_value,
+                "inference_timesteps": inference_timesteps,
+                "normalize": normalize,
+                "denoise": denoise,
+            }
+            include_reference_wav = reference_path is not None and (
+                not prompt_text or ultimate_use_reference
+            )
+            if include_reference_wav:
+                generate_kwargs["reference_wav_path"] = str(reference_path)
+            if prompt_text and reference_path is not None:
+                generate_kwargs["prompt_wav_path"] = str(reference_path)
+                generate_kwargs["prompt_text"] = prompt_text
+            generate_started = time.perf_counter()
+            wav = model.generate(**generate_kwargs)
             generate_wall_ms = (time.perf_counter() - generate_started) * 1000.0
 
         encode_started = time.perf_counter()
@@ -245,6 +277,21 @@ class VoxCPM2TTSRuntime:
             len(cases),
             (time.perf_counter() - started) * 1000.0,
         )
+
+
+def _prompt_text_for_request(request: ResponseRequest) -> str | None:
+    reference_audio = request.voice.reference_audio
+    if reference_audio is None:
+        return None
+    text = str(reference_audio.prompt_text or "").strip()
+    return text or None
+
+
+def _ultimate_use_reference_for_request(request: ResponseRequest) -> bool:
+    reference_audio = request.voice.reference_audio
+    if reference_audio is None:
+        return True
+    return bool(reference_audio.also_use_as_reference)
 
 
 def _voxcpm2_text(text: str, control: str) -> str:

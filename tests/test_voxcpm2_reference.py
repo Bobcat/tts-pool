@@ -73,6 +73,109 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
         self.assertIn("Pronounce numbers", model.generate_kwargs["text"])
         self.assertIn("Match the speaking pace", model.generate_kwargs["text"])
 
+    def test_prompt_text_engages_ultimate_cloning(self) -> None:
+        model = FakeVoxCPM()
+        runtime = VoxCPM2TTSRuntime(
+            model_name="voxcpm2",
+            model_settings=ModelSettings(backend="voxcpm2"),
+        )
+        runtime._model = model
+        reference = ReferenceAudio(
+            mime_type="audio/wav",
+            data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+            max_duration_s=1.0,
+            prompt_text="Ik lees dit korte bericht met een rustige stem.",
+        )
+
+        result = runtime.synthesize(
+            ResponseRequest(
+                model="voxcpm2",
+                input="Hallo wereld",
+                language="Dutch",
+                voice=VoiceSpec(
+                    instructions="Speak in Dutch.",
+                    reference_audio=reference,
+                ),
+            )
+        )
+
+        kwargs = model.generate_kwargs
+        self.assertIsNotNone(kwargs["reference_wav_path"])
+        self.assertEqual(kwargs["prompt_wav_path"], kwargs["reference_wav_path"])
+        self.assertEqual(
+            kwargs["prompt_text"],
+            "Ik lees dit korte bericht met een rustige stem.",
+        )
+        self.assertTrue(result.metadata["ultimate_cloning"])
+
+    def test_prompt_only_mode_drops_reference_wav_path(self) -> None:
+        model = FakeVoxCPM()
+        runtime = VoxCPM2TTSRuntime(
+            model_name="voxcpm2",
+            model_settings=ModelSettings(backend="voxcpm2"),
+        )
+        runtime._model = model
+        reference = ReferenceAudio(
+            mime_type="audio/wav",
+            data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+            max_duration_s=1.0,
+            prompt_text="Ik lees dit korte bericht met een rustige stem.",
+            also_use_as_reference=False,
+        )
+
+        result = runtime.synthesize(
+            ResponseRequest(
+                model="voxcpm2",
+                input="Hallo wereld",
+                language="Dutch",
+                voice=VoiceSpec(
+                    instructions="Speak in Dutch.",
+                    reference_audio=reference,
+                ),
+            )
+        )
+
+        kwargs = model.generate_kwargs
+        self.assertNotIn("reference_wav_path", kwargs)
+        self.assertIsNotNone(kwargs["prompt_wav_path"])
+        self.assertEqual(
+            kwargs["prompt_text"],
+            "Ik lees dit korte bericht met een rustige stem.",
+        )
+        self.assertTrue(result.metadata["ultimate_cloning"])
+        self.assertFalse(result.metadata["ultimate_cloning_with_reference"])
+
+    def test_missing_prompt_text_keeps_reference_only_mode(self) -> None:
+        model = FakeVoxCPM()
+        runtime = VoxCPM2TTSRuntime(
+            model_name="voxcpm2",
+            model_settings=ModelSettings(backend="voxcpm2"),
+        )
+        runtime._model = model
+        reference = ReferenceAudio(
+            mime_type="audio/wav",
+            data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+            max_duration_s=1.0,
+        )
+
+        result = runtime.synthesize(
+            ResponseRequest(
+                model="voxcpm2",
+                input="Hallo wereld",
+                language="Dutch",
+                voice=VoiceSpec(
+                    instructions="Speak in Dutch.",
+                    reference_audio=reference,
+                ),
+            )
+        )
+
+        kwargs = model.generate_kwargs
+        self.assertIsNotNone(kwargs["reference_wav_path"])
+        self.assertNotIn("prompt_wav_path", kwargs)
+        self.assertNotIn("prompt_text", kwargs)
+        self.assertFalse(result.metadata["ultimate_cloning"])
+
     def test_reference_audio_does_not_add_implicit_pace_prompt(self) -> None:
         model = FakeVoxCPM()
         runtime = VoxCPM2TTSRuntime(

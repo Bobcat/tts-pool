@@ -13,6 +13,20 @@ class ReferenceAudio(BaseModel):
     mime_type: str = "audio/wav"
     data_base64: str
     max_duration_s: float | None = Field(default=None, gt=0.0, le=60.0)
+    # Transcript of the reference audio. When provided, VoxCPM-family
+    # engines switch from reference-only to "ultimate cloning": the WAV
+    # is sent as the prompt audio, paired with this transcript, so the
+    # model anchors voice identity to a known (audio, text) pair before
+    # generating the target text.
+    prompt_text: str | None = None
+    # Ultimate-cloning sub-mode: when prompt_text is set, also pass the
+    # same WAV as the reference_wav (voice-isolation prefix). VoxCPM2
+    # docs call this "optional, for better similarity" — default True
+    # picks that recommendation. Set False for the UC1 prompt-only path
+    # (continuation seed without the extra ref-isolation prefix), which
+    # is a few percent cheaper and sometimes preferred by advanced
+    # users tuning by ear.
+    also_use_as_reference: bool = True
 
 
 class VoiceSpec(BaseModel):

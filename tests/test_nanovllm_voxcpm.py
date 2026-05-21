@@ -84,6 +84,124 @@ class NanoVLLMVoxCPMTests(unittest.TestCase):
         self.assertIn("Pronounce numbers", server.generate_kwargs["target_text"])
         self.assertIn("Match the speaking pace", server.generate_kwargs["target_text"])
 
+    def test_prompt_text_engages_ultimate_cloning(self) -> None:
+        server = FakeNanoServer()
+        runtime = NanoVLLMVoxCPMTTSRuntime(
+            model_name="nanovllm_voxcpm",
+            model_settings=ModelSettings(
+                backend="nanovllm_voxcpm",
+                nanovllm_reference_max_duration_s=8.0,
+            ),
+        )
+        runtime._start_loop()
+        runtime._server = server
+        runtime._model_info = {"sample_rate": 16000}
+        self.addCleanup(runtime.close)
+
+        result = runtime.synthesize(
+            ResponseRequest(
+                model="nanovllm_voxcpm",
+                input="Hallo wereld",
+                language="Dutch",
+                voice=VoiceSpec(
+                    instructions="Speak in Dutch.",
+                    reference_audio=ReferenceAudio(
+                        mime_type="audio/wav",
+                        data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+                        max_duration_s=1.0,
+                        prompt_text="Ik lees dit korte bericht met een rustige stem.",
+                    ),
+                ),
+            )
+        )
+
+        kwargs = server.generate_kwargs
+        self.assertEqual(kwargs["ref_audio_latents"], b"latents-1")
+        self.assertEqual(kwargs["prompt_latents"], b"latents-1")
+        self.assertEqual(
+            kwargs["prompt_text"],
+            "Ik lees dit korte bericht met een rustige stem.",
+        )
+        self.assertTrue(result.metadata["ultimate_cloning"])
+
+    def test_prompt_only_mode_drops_ref_audio_latents(self) -> None:
+        server = FakeNanoServer()
+        runtime = NanoVLLMVoxCPMTTSRuntime(
+            model_name="nanovllm_voxcpm",
+            model_settings=ModelSettings(
+                backend="nanovllm_voxcpm",
+                nanovllm_reference_max_duration_s=8.0,
+            ),
+        )
+        runtime._start_loop()
+        runtime._server = server
+        runtime._model_info = {"sample_rate": 16000}
+        self.addCleanup(runtime.close)
+
+        result = runtime.synthesize(
+            ResponseRequest(
+                model="nanovllm_voxcpm",
+                input="Hallo wereld",
+                language="Dutch",
+                voice=VoiceSpec(
+                    instructions="Speak in Dutch.",
+                    reference_audio=ReferenceAudio(
+                        mime_type="audio/wav",
+                        data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+                        max_duration_s=1.0,
+                        prompt_text="Ik lees dit korte bericht met een rustige stem.",
+                        also_use_as_reference=False,
+                    ),
+                ),
+            )
+        )
+
+        kwargs = server.generate_kwargs
+        self.assertNotIn("ref_audio_latents", kwargs)
+        self.assertEqual(kwargs["prompt_latents"], b"latents-1")
+        self.assertEqual(
+            kwargs["prompt_text"],
+            "Ik lees dit korte bericht met een rustige stem.",
+        )
+        self.assertTrue(result.metadata["ultimate_cloning"])
+        self.assertFalse(result.metadata["ultimate_cloning_with_reference"])
+
+    def test_missing_prompt_text_keeps_reference_only_mode(self) -> None:
+        server = FakeNanoServer()
+        runtime = NanoVLLMVoxCPMTTSRuntime(
+            model_name="nanovllm_voxcpm",
+            model_settings=ModelSettings(
+                backend="nanovllm_voxcpm",
+                nanovllm_reference_max_duration_s=8.0,
+            ),
+        )
+        runtime._start_loop()
+        runtime._server = server
+        runtime._model_info = {"sample_rate": 16000}
+        self.addCleanup(runtime.close)
+
+        result = runtime.synthesize(
+            ResponseRequest(
+                model="nanovllm_voxcpm",
+                input="Hallo wereld",
+                language="Dutch",
+                voice=VoiceSpec(
+                    instructions="Speak in Dutch.",
+                    reference_audio=ReferenceAudio(
+                        mime_type="audio/wav",
+                        data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+                        max_duration_s=1.0,
+                    ),
+                ),
+            )
+        )
+
+        kwargs = server.generate_kwargs
+        self.assertEqual(kwargs["ref_audio_latents"], b"latents-1")
+        self.assertNotIn("prompt_latents", kwargs)
+        self.assertNotIn("prompt_text", kwargs)
+        self.assertFalse(result.metadata["ultimate_cloning"])
+
     def test_voice_preset_is_rejected(self) -> None:
         runtime = NanoVLLMVoxCPMTTSRuntime(
             model_name="nanovllm_voxcpm",
