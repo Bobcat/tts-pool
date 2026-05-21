@@ -15,6 +15,8 @@ from app.schemas import ResponseRequest
 
 from .common import decode_reference_audio
 from .voxcpm2 import _copy_wav_tail
+from .voxcpm2 import _prompt_text_for_request
+from .voxcpm2 import _ultimate_use_reference_for_request
 from .voxcpm2 import _voxcpm2_text
 from .voxcpm2 import _wav_bytes
 from .voxcpm2 import _wav_duration_ms
@@ -79,6 +81,10 @@ class NanoVLLMVoxCPMTTSRuntime:
             raise RuntimeError("NanoVLLM VoxCPM model is not loaded")
         started_at = time.perf_counter()
         control = self._control_for_request(request)
+        # See voxcpm2.py: drop the (control)-prefix when ultimate
+        # cloning is on, otherwise VoxCPM2 narrates it literally.
+        if _prompt_text_for_request(request):
+            control = ""
         text = _voxcpm2_text(request.input, control)
         reference_started_at = time.perf_counter()
         reference_wav, reference_metadata = self._reference_wav(request)
@@ -155,16 +161,35 @@ class NanoVLLMVoxCPMTTSRuntime:
 
         import numpy as np
 
+        # Ultimate-cloning when the request pairs the reference WAV
+        # with a transcript. Two sub-modes (see voxcpm2.py comment):
+        #   UC2 (default): same latents passed as both ref and prompt.
+        #   UC1: prompt-only; drop ref_audio_latents.
+        prompt_text = _prompt_text_for_request(request)
+        ultimate_use_reference = (
+            prompt_text is not None and _ultimate_use_reference_for_request(request)
+        )
+        reference_metadata["ultimate_cloning"] = bool(prompt_text)
+        reference_metadata["ultimate_cloning_with_reference"] = bool(ultimate_use_reference)
+        include_ref_latents = reference_latents is not None and (
+            not prompt_text or ultimate_use_reference
+        )
+        generate_kwargs: dict[str, Any] = {
+            "target_text": text,
+            "max_generate_length": max_generate_length,
+            "temperature": temperature,
+            "cfg_value": cfg_value,
+        }
+        if include_ref_latents:
+            generate_kwargs["ref_audio_latents"] = reference_latents
+        if prompt_text:
+            generate_kwargs["prompt_latents"] = reference_latents
+            generate_kwargs["prompt_text"] = prompt_text
+
         chunks: list[Any] = []
         first_chunk_ms: float | None = None
         generate_started = time.perf_counter()
-        async for chunk in server.generate(
-            target_text=text,
-            max_generate_length=max_generate_length,
-            temperature=temperature,
-            cfg_value=cfg_value,
-            ref_audio_latents=reference_latents,
-        ):
+        async for chunk in server.generate(**generate_kwargs):
             if first_chunk_ms is None:
                 first_chunk_ms = (time.perf_counter() - generate_started) * 1000.0
             chunks.append(np.asarray(chunk, dtype=np.float32).reshape(-1))
