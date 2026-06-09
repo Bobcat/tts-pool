@@ -17,6 +17,7 @@ from .common import ModelRuntimeState
 from .common import ModelStateError
 from .common import model_definition_payload
 from .common import query_gpu_memory
+from .common import query_primary_gpu_used_mib
 from .common import UnknownModelError
 from .scheduler import ExecutorSnapshot
 from .scheduler import LoadedModelExecutor
@@ -150,6 +151,7 @@ class TTSRouterEngine:
             )
             state.configured_target_inflight = target_inflight
 
+        gpu_used_before_mib = query_primary_gpu_used_mib()
         try:
             runtime = _build_runtime(
                 model_name=model_name,
@@ -174,6 +176,17 @@ class TTSRouterEngine:
                 self._state_changed.notify_all()
             raise RuntimeError(message) from exc
 
+        gpu_used_after_mib = query_primary_gpu_used_mib()
+        observed_vram_mib: int | None = None
+        if (
+            gpu_used_before_mib is not None
+            and gpu_used_after_mib is not None
+            and gpu_used_after_mib >= gpu_used_before_mib
+        ):
+            delta = gpu_used_after_mib - gpu_used_before_mib
+            if delta > 0:
+                observed_vram_mib = delta
+
         with self._state_lock:
             self._runtimes[model_name] = runtime
             self._executors[model_name] = executor
@@ -181,6 +194,8 @@ class TTSRouterEngine:
             state.lifecycle = "loaded"
             state.last_error = None
             state.effective_target_inflight = min(target_inflight, int(getattr(runtime, "runtime_capability", 1) or 1))
+            if observed_vram_mib is not None:
+                state.observed_vram_mib = observed_vram_mib
             self._state_changed.notify_all()
             return self._admin_model_entry_locked(model_name, model_settings)
 
@@ -223,7 +238,7 @@ class TTSRouterEngine:
     def _admin_model_entry_locked(self, model_name: str, model_settings: ModelSettings) -> dict[str, object]:
         state = self._model_states[model_name]
         snapshot = self._executor_snapshot_locked(model_name)
-        estimate = estimate_model_artifact_size_mib(model_settings.model_path)
+        vram_estimate_mib, vram_estimate_source = self._vram_estimate_locked(model_name, model_settings)
         return {
             "name": model_name,
             "resolved_backend": state.resolved_backend,
@@ -235,22 +250,36 @@ class TTSRouterEngine:
             "configured_target_inflight": state.configured_target_inflight,
             "effective_target_inflight": snapshot.effective_target_inflight,
             "last_error": state.last_error,
-            "vram_estimate_mib": estimate,
-            "vram_estimate_source": "model_artifact_size" if estimate is not None else "unavailable",
+            "vram_estimate_mib": vram_estimate_mib,
+            "vram_estimate_source": vram_estimate_source,
             "capabilities": capabilities_for_backend(state.resolved_backend, model_settings),
             "definition": model_definition_payload(model_settings, resolved_backend=state.resolved_backend),
         }
 
     def _admin_gpu_model_entry_locked(self, model_name: str, model_settings: ModelSettings) -> dict[str, object]:
         state = self._model_states[model_name]
-        estimate = estimate_model_artifact_size_mib(model_settings.model_path)
+        vram_estimate_mib, vram_estimate_source = self._vram_estimate_locked(model_name, model_settings)
         return {
             "name": model_name,
             "runtime_state": state.lifecycle,
             "is_loaded": state.lifecycle == "loaded",
-            "vram_estimate_mib": estimate,
-            "vram_estimate_source": "model_artifact_size" if estimate is not None else "unavailable",
+            "vram_estimate_mib": vram_estimate_mib,
+            "vram_estimate_source": vram_estimate_source,
         }
+
+    def _vram_estimate_locked(
+        self,
+        model_name: str,
+        model_settings: ModelSettings,
+    ) -> tuple[int | None, str]:
+        state = self._model_states[model_name]
+        if state.observed_vram_mib is not None:
+            return state.observed_vram_mib, "observed_load_delta"
+        if state.artifact_size_mib is None:
+            state.artifact_size_mib = estimate_model_artifact_size_mib(model_settings.model_path)
+        if state.artifact_size_mib is not None:
+            return state.artifact_size_mib, "model_artifact_size"
+        return None, "unavailable"
 
     def _executor_snapshot_locked(self, model_name: str) -> ExecutorSnapshot:
         executor = self._executors.get(model_name)

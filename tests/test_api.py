@@ -8,6 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 import unittest
+from unittest import mock
 
 
 HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
@@ -124,6 +125,36 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(disabled_model["configured_enabled"])
         self.assertEqual(disabled_model["runtime_state"], "unloaded")
         self.assertFalse(disabled_model["is_loaded"])
+
+    def test_admin_models_reports_observed_vram_load_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "settings.json"
+            settings_path.write_text(
+                "{\n"
+                '  "engine": {\n'
+                '    "backend": "stub",\n'
+                '    "models": {\n'
+                '      "stub-tts": {"backend": "stub", "enabled": true, "target_inflight": 2}\n'
+                "    }\n"
+                "  }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            from app.config import load_settings
+            from app.engine.router import TTSRouterEngine
+
+            settings = load_settings(settings_path)
+            with mock.patch("app.engine.router.query_primary_gpu_used_mib", side_effect=[100, 123]):
+                engine = TTSRouterEngine(settings)
+            try:
+                enabled_model = engine.admin_models_payload()["models"][0]
+            finally:
+                engine.close()
+
+        self.assertEqual(enabled_model["name"], "stub-tts")
+        self.assertEqual(enabled_model["vram_estimate_mib"], 23)
+        self.assertEqual(enabled_model["vram_estimate_source"], "observed_load_delta")
 
     def test_load_and_unload_disabled_model(self) -> None:
         client = self._create_client()

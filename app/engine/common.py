@@ -38,6 +38,8 @@ class ModelRuntimeState:
     configured_target_inflight: int = 1
     effective_target_inflight: int = 1
     last_error: str | None = None
+    observed_vram_mib: int | None = None
+    artifact_size_mib: int | None = None
 
 
 def exception_message(exc: Exception) -> str:
@@ -118,6 +120,16 @@ def query_gpu_memory() -> tuple[list[dict[str, object]], str | None]:
             }
         )
     return gpus, None
+
+
+def query_primary_gpu_used_mib() -> int | None:
+    gpus, _ = query_gpu_memory()
+    if not gpus:
+        return None
+    used = gpus[0].get("used_mib")
+    if isinstance(used, int):
+        return used
+    return None
 
 
 def model_definition_payload(model_settings: ModelSettings, *, resolved_backend: str) -> dict[str, Any]:

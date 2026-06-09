@@ -104,7 +104,7 @@ class AdminModelEntry(BaseModel):
     effective_target_inflight: int = Field(default=1, ge=1)
     last_error: str | None = None
     vram_estimate_mib: int | None = Field(default=None, ge=0)
-    vram_estimate_source: Literal["model_artifact_size", "unavailable"] = "unavailable"
+    vram_estimate_source: Literal["observed_load_delta", "model_artifact_size", "unavailable"] = "unavailable"
     capabilities: dict[str, Any] = Field(default_factory=dict)
     definition: dict[str, Any] = Field(default_factory=dict)
 
@@ -126,7 +126,7 @@ class AdminGpuMemoryModelEstimate(BaseModel):
     runtime_state: Literal["unloaded", "loading", "loaded", "unloading", "failed"]
     is_loaded: bool
     vram_estimate_mib: int | None = Field(default=None, ge=0)
-    vram_estimate_source: Literal["model_artifact_size", "unavailable"] = "unavailable"
+    vram_estimate_source: Literal["observed_load_delta", "model_artifact_size", "unavailable"] = "unavailable"
 
 
 class AdminGpuMemoryEnvelope(BaseModel):
