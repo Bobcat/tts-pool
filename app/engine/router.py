@@ -26,6 +26,7 @@ from .scheduler import LoadedModelExecutor
 class TTSRouterEngine:
     def __init__(self, settings: AppSettings) -> None:
         self._configured_models = dict(settings.engine.models)
+        self._fairness_settings = settings.engine.fairness
         if not self._configured_models:
             raise ValueError("no configured models")
         self._runtimes: dict[str, Any] = {}
@@ -164,6 +165,7 @@ class TTSRouterEngine:
                 model_name=model_name,
                 complete_fn=runtime.synthesize,
                 configured_target_inflight=target_inflight,
+                fairness_settings=self._fairness_settings,
                 runtime_capability=runtime_capability,
             )
             executor.start()
@@ -247,8 +249,26 @@ class TTSRouterEngine:
             "is_loaded": state.lifecycle == "loaded",
             "inflight_requests": state.inflight_requests,
             "queue_depth": snapshot.queue_depth,
+            "runtime_inflight": snapshot.runtime_inflight,
             "configured_target_inflight": state.configured_target_inflight,
             "effective_target_inflight": snapshot.effective_target_inflight,
+            "accepting_new_requests": snapshot.accepting_new_requests,
+            "fairness": {
+                "rejected_per_key_limit": snapshot.fairness_rejected_per_key_limit,
+                "rejected_executor_limit": snapshot.fairness_rejected_executor_limit,
+                "keys": [
+                    {
+                        "fairness_key": key_snapshot.fairness_key,
+                        "pending": key_snapshot.pending,
+                        "active": key_snapshot.active,
+                        "weight": key_snapshot.weight,
+                        "score": key_snapshot.score,
+                        "rejected_per_key_limit": key_snapshot.rejected_per_key_limit,
+                        "rejected_executor_limit": key_snapshot.rejected_executor_limit,
+                    }
+                    for key_snapshot in snapshot.fairness_keys
+                ],
+            },
             "last_error": state.last_error,
             "vram_estimate_mib": vram_estimate_mib,
             "vram_estimate_source": vram_estimate_source,

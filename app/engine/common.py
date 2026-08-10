@@ -29,6 +29,14 @@ class ModelStateError(Exception):
         self.code = code
 
 
+class RequestAdmissionError(Exception):
+    def __init__(self, *, status_code: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+        self.code = str(code)
+        self.message = str(message)
+
+
 @dataclass
 class ModelRuntimeState:
     resolved_backend: str

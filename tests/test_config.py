@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -9,6 +10,73 @@ from app.config import load_settings
 
 
 class ConfigTests(unittest.TestCase):
+    def test_fairness_defaults_are_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "settings.json"
+            settings_path.write_text("{}\n", encoding="utf-8")
+
+            fairness = load_settings(settings_path).engine.fairness
+
+        self.assertEqual(fairness.default_weight, 1.0)
+        self.assertEqual(fairness.weights, {})
+        self.assertEqual(fairness.soft_max_inflight_per_key, 1)
+        self.assertEqual(fairness.max_pending_per_key, 4)
+        self.assertEqual(fairness.max_pending_per_executor, 8)
+        self.assertEqual(fairness.idle_state_ttl_s, 300.0)
+
+    def test_fairness_settings_and_weights_are_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "engine": {
+                            "fairness": {
+                                "default_weight": 1.5,
+                                "weights": {"  priority-workload  ": 2.0},
+                                "soft_max_inflight_per_key": 2,
+                                "max_pending_per_key": 3,
+                                "max_pending_per_executor": 6,
+                                "idle_state_ttl_s": 90,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            fairness = load_settings(settings_path).engine.fairness
+
+        self.assertEqual(fairness.default_weight, 1.5)
+        self.assertEqual(fairness.weights, {"priority-workload": 2.0})
+        self.assertEqual(fairness.soft_max_inflight_per_key, 2)
+        self.assertEqual(fairness.max_pending_per_key, 3)
+        self.assertEqual(fairness.max_pending_per_executor, 6)
+        self.assertEqual(fairness.idle_state_ttl_s, 90.0)
+
+    def test_invalid_fairness_settings_are_rejected(self) -> None:
+        invalid_payloads = (
+            {"default_weight": 0},
+            {"default_weight": "inf"},
+            {"weights": []},
+            {"weights": {" ": 1.0}},
+            {"weights": {"a": -1.0}},
+            {"soft_max_inflight_per_key": 0},
+            {"max_pending_per_key": 1.5},
+            {"max_pending_per_executor": -1},
+            {"idle_state_ttl_s": "nan"},
+        )
+        for fairness_payload in invalid_payloads:
+            with self.subTest(fairness_payload=fairness_payload):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    settings_path = Path(tmpdir) / "settings.json"
+                    settings_path.write_text(
+                        json.dumps({"engine": {"fairness": fairness_payload}}),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ValueError):
+                        load_settings(settings_path)
+
     def test_load_settings_merges_local_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings_path = Path(tmpdir) / "settings.json"

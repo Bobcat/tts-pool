@@ -7,11 +7,15 @@ from typing import Literal
 
 from pydantic import BaseModel
 from pydantic import Field
+from pydantic import field_validator
+
+
+MAX_REFERENCE_AUDIO_BASE64_CHARS = 16_777_216
 
 
 class ReferenceAudio(BaseModel):
     mime_type: str = "audio/wav"
-    data_base64: str
+    data_base64: str = Field(max_length=MAX_REFERENCE_AUDIO_BASE64_CHARS)
     max_duration_s: float | None = Field(default=None, gt=0.0, le=60.0)
     # Transcript of the reference audio. When provided, VoxCPM-family
     # engines switch from reference-only to "ultimate cloning": the WAV
@@ -66,10 +70,23 @@ class ResponseRequest(BaseModel):
     model: str
     input: str
     language: str
+    fairness_key: str | None = Field(default=None, max_length=128)
     voice: VoiceSpec = Field(default_factory=VoiceSpec)
     format: AudioFormat = Field(default_factory=AudioFormat)
     generation: GenerationParams = Field(default_factory=GenerationParams)
     stream: bool = False
+
+    @field_validator("fairness_key", mode="before")
+    @classmethod
+    def _normalize_fairness_key(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("fairness_key must be a string")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("fairness_key must not be blank")
+        return normalized
 
 
 class AudioOutput(BaseModel):
@@ -92,6 +109,22 @@ class AdminLoadRequest(BaseModel):
     target_inflight: int | None = Field(default=None, ge=1)
 
 
+class AdminFairnessKeyEntry(BaseModel):
+    fairness_key: str | None = None
+    pending: int = Field(default=0, ge=0)
+    active: int = Field(default=0, ge=0)
+    weight: float = Field(default=1.0, gt=0.0)
+    score: float = Field(default=0.0, ge=0.0)
+    rejected_per_key_limit: int = Field(default=0, ge=0)
+    rejected_executor_limit: int = Field(default=0, ge=0)
+
+
+class AdminFairnessSnapshot(BaseModel):
+    rejected_per_key_limit: int = Field(default=0, ge=0)
+    rejected_executor_limit: int = Field(default=0, ge=0)
+    keys: list[AdminFairnessKeyEntry] = Field(default_factory=list)
+
+
 class AdminModelEntry(BaseModel):
     name: str
     resolved_backend: str
@@ -100,8 +133,11 @@ class AdminModelEntry(BaseModel):
     is_loaded: bool
     inflight_requests: int = Field(default=0, ge=0)
     queue_depth: int = Field(default=0, ge=0)
+    runtime_inflight: int = Field(default=0, ge=0)
     configured_target_inflight: int = Field(default=1, ge=1)
     effective_target_inflight: int = Field(default=1, ge=1)
+    accepting_new_requests: bool = False
+    fairness: AdminFairnessSnapshot = Field(default_factory=AdminFairnessSnapshot)
     last_error: str | None = None
     vram_estimate_mib: int | None = Field(default=None, ge=0)
     vram_estimate_source: Literal["observed_load_delta", "model_artifact_size", "unavailable"] = "unavailable"

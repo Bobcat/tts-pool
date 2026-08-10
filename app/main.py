@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from app.config import load_settings
 from app.engine import build_engine
 from app.engine import ModelStateError
+from app.engine import RequestAdmissionError
 from app.engine import UnknownModelError
 from app.schemas import AdminGpuMemoryEnvelope
 from app.schemas import AdminLoadRequest
@@ -37,6 +38,7 @@ def _log_inference(response_id: str, request: ResponseRequest, metrics: dict[str
         "event": "tts_pool.inference",
         "request_id": response_id,
         "model": request.model,
+        "fairness_key": request.fairness_key,
         "stream": request.stream,
         "metrics": _metrics_payload(metrics),
     }
@@ -142,6 +144,11 @@ def create_app(settings_path: str | Path | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=409,
                 detail={"code": exc.code, "model": request.model},
+            ) from exc
+        except RequestAdmissionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.message},
             ) from exc
         except ValueError as exc:
             raise HTTPException(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -116,6 +117,11 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(enabled_model["runtime_state"], "loaded")
         self.assertTrue(enabled_model["is_loaded"])
         self.assertEqual(enabled_model["configured_target_inflight"], 2)
+        self.assertEqual(enabled_model["runtime_inflight"], 0)
+        self.assertTrue(enabled_model["accepting_new_requests"])
+        self.assertEqual(enabled_model["fairness"]["keys"], [])
+        self.assertEqual(enabled_model["fairness"]["rejected_per_key_limit"], 0)
+        self.assertEqual(enabled_model["fairness"]["rejected_executor_limit"], 0)
         self.assertEqual(enabled_model["capabilities"]["output_formats"], ["wav"])
         self.assertFalse(enabled_model["capabilities"]["streaming"])
         self.assertEqual(enabled_model["definition"]["target_inflight"], 2)
@@ -194,3 +200,59 @@ class ApiTests(unittest.TestCase):
         self.assertIn("gpus", payload)
         self.assertIn("models", payload)
         self.assertIn("error", payload)
+
+    def test_admission_errors_are_returned_as_429(self) -> None:
+        import app.main as main
+        from app.engine import RequestAdmissionError
+
+        class RejectingEngine:
+            code = ""
+
+            def complete(self, request):
+                del request
+                raise RequestAdmissionError(
+                    status_code=429,
+                    code=self.code,
+                    message="pending queue is full",
+                )
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "settings.json"
+            settings_path.write_text("{}\n", encoding="utf-8")
+            with mock.patch.object(main, "build_engine", return_value=RejectingEngine()):
+                app = main.create_app(settings_path)
+
+        with TestClient(app) as client:
+            for code in ("fairness_key_queue_full", "executor_queue_full"):
+                with self.subTest(code=code):
+                    RejectingEngine.code = code
+                    response = client.post(
+                        "/v1/responses",
+                        json={
+                            "model": "stub-tts",
+                            "input": "Hello",
+                            "language": "English",
+                        },
+                    )
+
+                    self.assertEqual(response.status_code, 429)
+                    self.assertEqual(response.json()["detail"]["code"], code)
+
+    def test_inference_log_contains_normalized_fairness_key(self) -> None:
+        import app.main as main
+        from app.schemas import ResponseRequest
+
+        request = ResponseRequest(
+            model="stub-tts",
+            input="Hello",
+            language="English",
+            fairness_key="  opaque-principal  ",
+        )
+        with mock.patch.object(main.LOGGER, "info") as info:
+            main._log_inference("ttsresp_test", request, {"wall_ms": 1.0})
+
+        payload = json.loads(info.call_args.args[1])
+        self.assertEqual(payload["fairness_key"], "opaque-principal")

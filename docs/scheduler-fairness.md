@@ -1,6 +1,7 @@
 # TTS Scheduler Fairness
 
-Status: design proposal, 2026-08-10.
+Status: implemented and validated under live NanoVLLM load, 2026-08-10. See
+[Scheduler and NanoVLLM load test](tts-scheduler-load-test.md).
 
 ## Goal
 
@@ -24,7 +25,7 @@ audio caching, stale-work cancellation, or playback ordering.
 ## Reference Policy
 
 This design adapts the per-model client fairness implemented in llm-pool at
-commit `6e66eaa`. That scheduler replaced one global FIFO with per-key FIFO
+commit `6149f89`. That scheduler replaced one global FIFO with per-key FIFO
 buckets, weighted least-served slot-time, a work-conserving soft inflight cap,
 bounded pending queues, and per-key observability.
 
@@ -119,16 +120,18 @@ Add one pool-wide section under `engine.fairness`:
 | `default_weight` | `1.0` |
 | `weights` | Empty mapping; reserved for trusted named workloads |
 | `soft_max_inflight_per_key` | `1` |
-| `max_pending_per_key` | Decide after request-memory and load measurement |
-| `max_pending_per_executor` | Decide after request-memory and load measurement |
-| `idle_state_ttl_s` | Candidate: llm-pool's 300 seconds; verify TTS key cardinality |
+| `max_pending_per_key` | `4` |
+| `max_pending_per_executor` | `8` |
+| `idle_state_ttl_s` | `300` seconds |
 
 Weights must be finite and greater than zero. Requests must not contain a
 weight or priority field. A key missing from `weights` uses `default_weight`.
 
-The queue limits need TTS-specific measurements. A pending TTS request can hold
-base64 reference audio and is materially larger than a normal text-only LLM
-request. Do not copy llm-pool queue depths without measuring this payload cost.
+The initial queue depths are deliberately below llm-pool's values. A pending
+TTS request can hold base64 reference audio and is materially larger than a
+normal text-only LLM request. The API also limits `reference_audio.data_base64`
+to 16,777,216 characters so a count limit also bounds retained reference-audio
+text. Revisit both limits after measuring representative request memory.
 
 The same fairness settings may be read by every model executor. Each executor
 keeps independent state. Per-model weight overrides are not needed in the first
@@ -193,17 +196,18 @@ Use one consistent time unit in the implementation.
 When a slot becomes free:
 
 1. collect keys with pending jobs;
-2. prefer keys below `soft_max_inflight_per_key`;
-3. if none are below the soft cap, consider every pending key;
-4. calculate each candidate's score;
-5. choose the lowest score;
-6. break equal scores with deterministic round-robin order;
-7. pop the oldest job from that key;
-8. record its active start time;
-9. start the existing worker path.
+2. calculate each candidate's score;
+3. choose the lowest score;
+4. for equal scores, prefer a key below `soft_max_inflight_per_key`;
+5. break remaining ties with deterministic round-robin order;
+6. pop the oldest job from that key;
+7. record its active start time;
+8. start the existing worker path.
 
-Step 3 makes the policy work-conserving. The soft cap is an anti-monopoly
-preference, not a hard per-key concurrency limit.
+The score remains primary so configured weights still control long-run
+slot-time when capacity is greater than one. The soft cap is an anti-monopoly
+tie-breaker, not a hard per-key concurrency limit. Every pending key remains a
+candidate, which keeps the executor work-conserving.
 
 On completion:
 
@@ -230,10 +234,11 @@ Do not add score decay in the first version.
 Assume `effective_target_inflight = 4` and a soft per-key cap of one.
 
 - If only key A has work, A may borrow all four slots.
-- If A and B are both queued while slots are available, each gets a slot before
-  either key borrows solely because the other key is at its soft cap.
-- If A already occupies all four slots when B arrives, B gets the next slot
-  released by A.
+- If equal-score keys A and B are both queued while slots are available, each
+  gets a slot before either key wins another equal-score tie.
+- If A already occupies all four slots when a new key B arrives, B enters at
+  A's current score and gets the next slot released by A as A's active service
+  continues to increase its score.
 - Running work is never interrupted.
 
 This provides fair progress and full utilization. It does not guarantee a
@@ -254,6 +259,16 @@ Bound pending work in two places:
 
 Active jobs do not count as pending. Check the per-key limit first, followed by
 the executor total.
+
+Reject `reference_audio.data_base64` values longer than 16,777,216 characters
+during request validation. Queue depths alone cannot bound retained memory when
+one request may contain an arbitrarily large string.
+
+The synchronous FastAPI response route holds one shared worker-thread token per
+active or pending request. Keep the aggregate configured queue capacity across
+loaded executors below that worker capacity with headroom for admin requests.
+If the number of loaded executors or queue depths grows, replace the blocking
+API-to-scheduler bridge before raising these limits.
 
 Reject before enqueue with HTTP `429`:
 
@@ -358,9 +373,11 @@ later, one public model should keep one shared fairness queue across them.
 Add deterministic tests for:
 
 - fairness-key trimming, length, blank rejection, and anonymous default;
+- reference-audio base64 length rejection;
 - FIFO order within one key;
 - round-robin tie-breaking between equal keys;
-- weighted long-run slot-time with unequal synthesis durations;
+- weighted long-run slot-time with unequal synthesis durations and effective
+  capacities 1, 2, and 4;
 - active elapsed time affecting selection before completion;
 - one key borrowing every slot while alone;
 - a waiting key receiving the next released slot;
@@ -423,15 +440,16 @@ The first scheduler slice does not add:
 - playback-order state;
 - a TTS replica architecture.
 
-## Decisions Before Code
+## Initial Operational Values
 
-The scheduling algorithm and request identity shape are settled by this design.
-Choose these operational values before changing `config/settings.json`:
+Start with:
 
-1. `max_pending_per_key`;
-2. `max_pending_per_executor`;
-3. `idle_state_ttl_s`;
-4. the first deployed `target_inflight` and Nano-vLLM `max_num_seqs` pair.
+1. `max_pending_per_key = 4`;
+2. `max_pending_per_executor = 8`;
+3. `idle_state_ttl_s = 300`;
+4. `target_inflight = 2` and Nano-vLLM `max_num_seqs = 2` in the first live
+   deployment;
+5. at most 16,777,216 base64 characters per reference-audio value.
 
-Base those choices on measured request memory and concurrency behavior. They are
-runtime controls, not product entitlements.
+These are runtime controls, not product entitlements. Revisit the queue depths
+and concurrency pair after the load measurement described above.

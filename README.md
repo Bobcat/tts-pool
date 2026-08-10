@@ -3,7 +3,8 @@
 FastAPI service for serving configured text-to-speech models through one
 JSON-over-HTTP response API. It supports Kokoro, VoxCPM2, and
 NanoVLLM-VoxCPM backends, with runtime model administration, per-model
-scheduling, timing metrics, and GPU memory inspection.
+scheduling, timing metrics, and GPU memory inspection. The scheduler shares
+model capacity between clients and limits how much work may wait in a queue.
 
 ## Index
 
@@ -13,6 +14,7 @@ scheduling, timing metrics, and GPU memory inspection.
 - [Request Fields](#request-fields)
 - [Voice And Reference Audio](#voice-and-reference-audio)
 - [Local Overrides](#local-overrides)
+- [Client Fairness](#client-fairness)
 - [Timing Metrics](#timing-metrics)
 - [Deployment Notes](#deployment-notes)
 - [Test](#test)
@@ -25,7 +27,8 @@ scheduling, timing metrics, and GPU memory inspection.
 - Configured model ids can use `kokoro`, `voxcpm2`, or `nanovllm_voxcpm`.
 - Responses include base64 WAV audio, timing metrics, and backend metadata.
 - Admin endpoints expose model state, runtime load/unload, queue state, and GPU memory.
-- Each loaded model has its own scheduler with configurable inflight limits.
+- Each loaded model has its own scheduler with weighted client fairness,
+  configurable inflight capacity, and bounded waiting queues.
 
 ## HTTP API
 
@@ -53,6 +56,7 @@ Example request:
   "model": "voxcpm2",
   "input": "Let's see if this works.",
   "language": "English",
+  "fairness_key": "interactive-client",
   "voice": {
     "instructions": "Speak in English. Use a clear, natural voice.",
     "reference_audio": {
@@ -118,10 +122,15 @@ Currently supported API request fields:
 | `model` | `string` | yes | none | Must match a currently loaded model id. |
 | `input` | `string` | yes | none | Text to synthesize. |
 | `language` | `string` | yes | none | Language label passed to the selected backend. |
+| `fairness_key` | `string \| null` | no | `null` | Stable client or work-category name. It is trimmed and limited to 128 characters. Requests without a key share one queue. |
 | `voice` | `object` | no | `{}` | Optional backend-specific voice id, instructions, and reference audio. |
 | `format.type` | `"wav"` | no | `"wav"` | WAV is the only supported output format. |
 | `generation` | `object` | no | `{}` | Backend-specific generation overrides. |
 | `stream` | `boolean` | no | `false` | `true` currently returns `400 stream_unsupported`. |
+
+`fairness_key` is used only for queueing inside `tts-pool`. The selected TTS
+backend never receives it. Use a small, stable set of keys; do not create a new
+key for every request.
 
 Kokoro generation fields:
 
@@ -235,6 +244,92 @@ Notes:
 - The base dependencies include the VoxCPM2 backend package.
 - Kokoro dependencies are available through `pip install -e '.[kokoro]'`.
 
+## Client Fairness
+
+Several services can send work to the same loaded TTS model. Without fairness,
+one busy client could keep filling every available place while other clients
+wait.
+
+Each request may include a stable `fairness_key`, such as:
+
+- `interactive-client`
+- `batch-worker`
+- `workbench`
+
+Requests with the same key keep their arrival order. Requests without a key
+share one anonymous queue. A key's name is only a label; words such as
+`interactive` do not grant priority by themselves.
+
+An active slot is one request currently running for a model. If a model has four
+slots, fairness behaves like this:
+
+- If only batch requests are waiting, they may use all four slots.
+- If an interactive request arrives, running batch requests are not interrupted.
+- The interactive request gets the next slot that becomes free.
+- If no other key is waiting, batch work may continue to use every slot.
+
+Fairness only compares clients while they need the same model at the same time.
+A client may use all available capacity while nobody else is waiting. When
+another client joins under its own key, the available capacity is shared
+according to the configured weights.
+
+The scheduler records how long requests from each key occupy runtime slots.
+Configured weights control the long-term split when several queues stay busy. A
+key with weight `2.0` gets about twice as much slot-time as a key with weight
+`1.0`. Requests cannot choose their own weight.
+
+Configure fairness under `engine.fairness`:
+
+```json
+{
+  "engine": {
+    "fairness": {
+      "default_weight": 1.0,
+      "weights": {
+        "interactive-client": 1.0,
+        "batch-worker": 1.0,
+        "workbench": 1.0
+      },
+      "soft_max_inflight_per_key": 1,
+      "max_pending_per_key": 4,
+      "max_pending_per_executor": 8,
+      "idle_state_ttl_s": 300
+    }
+  }
+}
+```
+
+The settings mean:
+
+| Setting | Meaning |
+| --- | --- |
+| `default_weight` | Weight for anonymous or unlisted keys. |
+| `weights` | Configured weight for known keys. |
+| `soft_max_inflight_per_key` | Preferred number of active requests per key while another key waits. It is not a hard limit. |
+| `max_pending_per_key` | Hard limit on waiting requests for one key. |
+| `max_pending_per_executor` | Hard limit on all waiting requests for one model. |
+| `idle_state_ttl_s` | How long the scheduler remembers used slot-time after a key has no active or waiting requests. |
+
+When two keys have weight `1.0` and both queues stay busy, they receive roughly
+equal slot-time. A client can still use all slots when no other key is waiting.
+This is weighted fair sharing, not strict priority or a hard per-key concurrency
+limit.
+
+Queue limits count waiting work, not active requests. Rejections use HTTP `429`
+with code `fairness_key_queue_full` or `executor_queue_full`. Reference-audio
+base64 is separately limited to 16,777,216 characters before a request can
+enter a queue.
+
+`GET /v1/admin/models` shows active and waiting counts, configured weights, and
+rejection counters per key. Each key receives a separate share, so trusted
+callers should keep the set of keys small and stable. If untrusted callers can
+reach the API, an authenticated gateway should assign or validate the key.
+
+See [docs/scheduler-fairness.md](docs/scheduler-fairness.md) for the scheduling
+policy and limitations. See
+[docs/tts-scheduler-load-test.md](docs/tts-scheduler-load-test.md) for the live
+NanoVLLM capacity and fairness measurements.
+
 ## Timing Metrics
 
 The response `metrics` payload uses nested timers:
@@ -311,6 +406,22 @@ systemctl --user restart tts-pool.service
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+The live NanoVLLM benchmark exercises concurrent synthesis and client fairness
+through the HTTP API:
+
+```bash
+.venv/bin/python scripts/tts_pool_fairness_bench.py \
+  --concurrencies 1,2 \
+  --repeats 3 \
+  --fairness-capacity 2 \
+  --output /tmp/tts-pool-fairness-capacity2.json
+```
+
+The benchmark requires a running service with Kokoro and NanoVLLM-VoxCPM
+loaded. It does not edit configuration or restart the service. See the
+[load-test report](docs/tts-scheduler-load-test.md) for the 4/4 and weighted
+test procedure.
 
 Additional checks used during development:
 
