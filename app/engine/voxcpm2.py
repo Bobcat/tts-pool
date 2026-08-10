@@ -214,14 +214,18 @@ class VoxCPM2TTSRuntime:
             "reference_max_duration_s": max_duration_s,
             "reference_source_duration_ms": original_duration_ms,
         }
-        if original_duration_ms <= int(max_duration_s * 1000):
+        prompt_text = _prompt_text_for_request(request)
+        skipped_clip_for_prompt_text = bool(prompt_text) and original_duration_ms > int(max_duration_s * 1000)
+        if original_duration_ms <= int(max_duration_s * 1000) or prompt_text:
             metadata["reference_clipped"] = False
             metadata["reference_duration_ms"] = original_duration_ms
+            metadata["reference_clip_skipped_for_prompt_text"] = skipped_clip_for_prompt_text
             return source_path, metadata
         clipped_path = tmpdir / "reference.wav"
         clipped_duration_ms = _copy_wav_tail(source_path, clipped_path, max_duration_s=max_duration_s)
         metadata["reference_clipped"] = True
         metadata["reference_duration_ms"] = clipped_duration_ms
+        metadata["reference_clip_skipped_for_prompt_text"] = False
         return clipped_path, metadata
 
     def _warmup(self, model: Any) -> None:

@@ -124,6 +124,42 @@ class NanoVLLMVoxCPMTests(unittest.TestCase):
         )
         self.assertTrue(result.metadata["ultimate_cloning"])
 
+    def test_prompt_text_reference_audio_is_not_clipped(self) -> None:
+        server = FakeNanoServer()
+        runtime = NanoVLLMVoxCPMTTSRuntime(
+            model_name="nanovllm_voxcpm",
+            model_settings=ModelSettings(
+                backend="nanovllm_voxcpm",
+                nanovllm_reference_max_duration_s=8.0,
+            ),
+        )
+        runtime._start_loop()
+        runtime._server = server
+        runtime._model_info = {"sample_rate": 16000}
+        self.addCleanup(runtime.close)
+
+        result = runtime.synthesize(
+            ResponseRequest(
+                model="nanovllm_voxcpm",
+                input="Hallo wereld",
+                language="Dutch",
+                voice=VoiceSpec(
+                    instructions="Speak in Dutch.",
+                    reference_audio=ReferenceAudio(
+                        mime_type="audio/wav",
+                        data_base64=base64.b64encode(_silent_wav(seconds=2.0)).decode("ascii"),
+                        max_duration_s=1.0,
+                        prompt_text="Ik lees dit korte bericht met een rustige stem.",
+                    ),
+                ),
+            )
+        )
+
+        self.assertFalse(result.metadata["reference_clipped"])
+        self.assertTrue(result.metadata["reference_clip_skipped_for_prompt_text"])
+        self.assertEqual(result.metadata["reference_duration_ms"], 2000)
+        self.assertEqual(_wav_duration_ms(server.encoded_wav or b""), 2000)
+
     def test_prompt_only_mode_drops_ref_audio_latents(self) -> None:
         server = FakeNanoServer()
         runtime = NanoVLLMVoxCPMTTSRuntime(

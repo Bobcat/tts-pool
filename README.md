@@ -165,10 +165,12 @@ VoxCPM2 and NanoVLLM-VoxCPM support `voice.reference_audio`:
 }
 ```
 
-The service clips reference WAV audio to the configured/requested maximum before
-passing it to the selected backend. If a client wants the model to follow the
-reference pace or articulation, that instruction belongs in
-`voice.instructions`.
+Without `prompt_text`, the service clips reference WAV audio to the
+configured/requested maximum before passing it to the selected backend. When
+`prompt_text` is present, the service keeps the complete WAV so the transcript
+stays aligned with the audio. In that mode, `max_duration_s` does not limit the
+reference audio. If a client wants the model to follow the reference pace or
+articulation, that instruction belongs in `voice.instructions`.
 
 ## Local Overrides
 

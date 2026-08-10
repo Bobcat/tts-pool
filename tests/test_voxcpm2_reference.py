@@ -26,10 +26,18 @@ class FakeVoxCPM:
         self.tts_model = FakeTTSModel()
         self.generate_kwargs = None
         self.generate_calls = []
+        self.prompt_wav_duration_ms = None
+        self.reference_wav_duration_ms = None
 
     def generate(self, **kwargs):
         self.generate_kwargs = kwargs
         self.generate_calls.append(kwargs)
+        prompt_path = kwargs.get("prompt_wav_path")
+        reference_path = kwargs.get("reference_wav_path")
+        if prompt_path is not None:
+            self.prompt_wav_duration_ms = _wav_path_duration_ms(prompt_path)
+        if reference_path is not None:
+            self.reference_wav_duration_ms = _wav_path_duration_ms(reference_path)
         return np.zeros(1600, dtype=np.float32)
 
 
@@ -107,6 +115,38 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
             "Ik lees dit korte bericht met een rustige stem.",
         )
         self.assertTrue(result.metadata["ultimate_cloning"])
+
+    def test_prompt_text_reference_audio_is_not_clipped(self) -> None:
+        model = FakeVoxCPM()
+        runtime = VoxCPM2TTSRuntime(
+            model_name="voxcpm2",
+            model_settings=ModelSettings(backend="voxcpm2"),
+        )
+        runtime._model = model
+        reference = ReferenceAudio(
+            mime_type="audio/wav",
+            data_base64=base64.b64encode(_silent_wav(seconds=2.0)).decode("ascii"),
+            max_duration_s=1.0,
+            prompt_text="Ik lees dit korte bericht met een rustige stem.",
+        )
+
+        result = runtime.synthesize(
+            ResponseRequest(
+                model="voxcpm2",
+                input="Hallo wereld",
+                language="Dutch",
+                voice=VoiceSpec(
+                    instructions="Speak in Dutch.",
+                    reference_audio=reference,
+                ),
+            )
+        )
+
+        self.assertFalse(result.metadata["reference_clipped"])
+        self.assertTrue(result.metadata["reference_clip_skipped_for_prompt_text"])
+        self.assertEqual(result.metadata["reference_duration_ms"], 2000)
+        self.assertEqual(model.prompt_wav_duration_ms, 2000)
+        self.assertEqual(model.reference_wav_duration_ms, 2000)
 
     def test_prompt_only_mode_drops_reference_wav_path(self) -> None:
         model = FakeVoxCPM()
@@ -288,3 +328,8 @@ def _silent_wav(*, seconds: float, sample_rate_hz: int = 16000) -> bytes:
         writer.setframerate(sample_rate_hz)
         writer.writeframes(frames)
     return buffer.getvalue()
+
+
+def _wav_path_duration_ms(path: str) -> int:
+    with wave.open(str(path), "rb") as reader:
+        return int((reader.getnframes() / reader.getframerate()) * 1000)
