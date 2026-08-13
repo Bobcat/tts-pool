@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import base64
 import io
+import threading
 import unittest
 import wave
 
@@ -10,6 +10,11 @@ import numpy as np
 from app.config import ModelSettings
 from app.config import NanoVLLMWarmupCase
 from app.engine.nanovllm_voxcpm import NanoVLLMVoxCPMTTSRuntime
+from app.engine.streaming import StreamAudioChunk
+from app.engine.streaming import StreamCompleted
+from app.engine.streaming import StreamStarted
+from app.engine.streaming import SynthesisCancelled
+from app.engine.streaming import SynthesisHandle
 from app.schemas import ReferenceAudio
 from app.schemas import ResponseRequest
 from app.schemas import VoiceSpec
@@ -38,7 +43,104 @@ class FakeNanoServer:
         self.stopped = True
 
 
+class ClosingNanoServer(FakeNanoServer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.second_chunk_yielded = threading.Event()
+        self.generate_closed = threading.Event()
+
+    async def generate(self, **kwargs):
+        self.generate_kwargs = kwargs
+        self.generate_calls.append(kwargs)
+        try:
+            yield np.zeros(1600, dtype=np.float32)
+            self.second_chunk_yielded.set()
+            yield np.zeros(1600, dtype=np.float32)
+        finally:
+            self.generate_closed.set()
+
+
 class NanoVLLMVoxCPMTests(unittest.TestCase):
+    def test_stream_emits_pcm_before_completed_event(self) -> None:
+        server = FakeNanoServer()
+        runtime = NanoVLLMVoxCPMTTSRuntime(
+            model_name="nanovllm_voxcpm",
+            model_settings=ModelSettings(backend="nanovllm_voxcpm"),
+        )
+        runtime._start_loop()
+        runtime._server = server
+        runtime._model_info = {"sample_rate": 16_000}
+        self.addCleanup(runtime.close)
+        handle = SynthesisHandle(
+            response_id="ttsresp_test",
+            model_name="nanovllm_voxcpm",
+            max_buffer_chunks=4,
+            max_buffer_bytes=16_384,
+            stalled_consumer_timeout_s=1.0,
+        )
+
+        request = ResponseRequest(
+            model="nanovllm_voxcpm",
+            input="Hallo wereld",
+            language="Dutch",
+        )
+        complete = runtime.synthesize(request)
+        result = runtime.synthesize_stream(request, handle)
+        handle.complete(result, metrics=result.metrics)
+        events = [handle.read_event(), handle.read_event(), handle.read_event()]
+
+        self.assertIsInstance(events[0], StreamStarted)
+        self.assertIsInstance(events[1], StreamAudioChunk)
+        self.assertIsInstance(events[2], StreamCompleted)
+        self.assertEqual(events[1].sequence_number, 0)
+        self.assertEqual(events[1].first_sample, 0)
+        self.assertEqual(len(events[1].pcm), 3_200)
+        self.assertEqual(result.total_sample_count, 1_600)
+        self.assertEqual(result.duration_ms, 100)
+        self.assertEqual(result.chunk_count, 1)
+        self.assertEqual(_wav_frames(complete.audio), events[1].pcm)
+
+    def test_stream_cancellation_closes_runtime_generator(self) -> None:
+        server = ClosingNanoServer()
+        runtime = NanoVLLMVoxCPMTTSRuntime(
+            model_name="nanovllm_voxcpm",
+            model_settings=ModelSettings(backend="nanovllm_voxcpm"),
+        )
+        runtime._start_loop()
+        runtime._server = server
+        runtime._model_info = {"sample_rate": 16_000}
+        self.addCleanup(runtime.close)
+        handle = SynthesisHandle(
+            response_id="ttsresp_cancel",
+            model_name="nanovllm_voxcpm",
+            max_buffer_chunks=1,
+            max_buffer_bytes=3_200,
+            stalled_consumer_timeout_s=1.0,
+        )
+        request = ResponseRequest(
+            model="nanovllm_voxcpm",
+            input="Hallo wereld",
+            language="Dutch",
+        )
+        errors: list[Exception] = []
+
+        def synthesize() -> None:
+            try:
+                runtime.synthesize_stream(request, handle)
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=synthesize)
+        worker.start()
+        self.assertTrue(server.second_chunk_yielded.wait(timeout=1.0))
+        handle.cancel()
+        worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], SynthesisCancelled)
+        self.assertTrue(server.generate_closed.wait(timeout=1.0))
+
     def test_synthesize_encodes_reference_and_generates_wav(self) -> None:
         server = FakeNanoServer()
         runtime = NanoVLLMVoxCPMTTSRuntime(
@@ -66,7 +168,7 @@ class NanoVLLMVoxCPMTests(unittest.TestCase):
                     ),
                     reference_audio=ReferenceAudio(
                         mime_type="audio/wav",
-                        data_base64=base64.b64encode(_silent_wav(seconds=2.0)).decode("ascii"),
+                        data=_silent_wav(seconds=2.0),
                         max_duration_s=1.0,
                     ),
                 ),
@@ -107,7 +209,7 @@ class NanoVLLMVoxCPMTests(unittest.TestCase):
                     instructions="Speak in Dutch.",
                     reference_audio=ReferenceAudio(
                         mime_type="audio/wav",
-                        data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+                        data=_silent_wav(seconds=1.0),
                         max_duration_s=1.0,
                         prompt_text="Ik lees dit korte bericht met een rustige stem.",
                     ),
@@ -147,7 +249,7 @@ class NanoVLLMVoxCPMTests(unittest.TestCase):
                     instructions="Speak in Dutch.",
                     reference_audio=ReferenceAudio(
                         mime_type="audio/wav",
-                        data_base64=base64.b64encode(_silent_wav(seconds=2.0)).decode("ascii"),
+                        data=_silent_wav(seconds=2.0),
                         max_duration_s=1.0,
                         prompt_text="Ik lees dit korte bericht met een rustige stem.",
                     ),
@@ -183,7 +285,7 @@ class NanoVLLMVoxCPMTests(unittest.TestCase):
                     instructions="Speak in Dutch.",
                     reference_audio=ReferenceAudio(
                         mime_type="audio/wav",
-                        data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+                        data=_silent_wav(seconds=1.0),
                         max_duration_s=1.0,
                         prompt_text="Ik lees dit korte bericht met een rustige stem.",
                         also_use_as_reference=False,
@@ -225,7 +327,7 @@ class NanoVLLMVoxCPMTests(unittest.TestCase):
                     instructions="Speak in Dutch.",
                     reference_audio=ReferenceAudio(
                         mime_type="audio/wav",
-                        data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+                        data=_silent_wav(seconds=1.0),
                         max_duration_s=1.0,
                     ),
                 ),
@@ -315,6 +417,11 @@ def _silent_wav(*, seconds: float, sample_rate_hz: int = 16000) -> bytes:
 def _wav_duration_ms(data: bytes) -> int:
     with wave.open(io.BytesIO(data), "rb") as reader:
         return int((reader.getnframes() / reader.getframerate()) * 1000)
+
+
+def _wav_frames(data: bytes) -> bytes:
+    with wave.open(io.BytesIO(data), "rb") as reader:
+        return reader.readframes(reader.getnframes())
 
 
 if __name__ == "__main__":

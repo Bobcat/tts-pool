@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import tempfile
 from pathlib import Path
 import unittest
@@ -97,7 +96,7 @@ class KokoroRuntimeTests(unittest.TestCase):
                         voice=VoiceSpec(
                             reference_audio=ReferenceAudio(
                                 mime_type="audio/wav",
-                                data_base64=base64.b64encode(b"not used").decode("ascii"),
+                                data=b"not used",
                             )
                         ),
                     )

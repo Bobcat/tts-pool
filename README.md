@@ -1,18 +1,16 @@
 # tts-pool
 
-FastAPI service for serving configured text-to-speech models through one
-JSON-over-HTTP response API. It supports Kokoro, VoxCPM2, and
-NanoVLLM-VoxCPM backends, with runtime model administration, per-model
-scheduling, timing metrics, and GPU memory inspection. The scheduler shares
-model capacity between clients and limits how much work may wait in a queue.
+Text-to-speech service with a streaming gRPC synthesis data plane and an HTTP
+control plane. It supports Kokoro, VoxCPM2, and NanoVLLM-VoxCPM backends, with
+runtime model administration, per-model scheduling, timing metrics, and GPU
+memory inspection. The scheduler shares model capacity between clients and
+limits how much work may wait in a queue.
 
 ## Index
 
 - [Overview](#overview)
-- [HTTP API](#http-api)
-- [Synthesis Example](#synthesis-example)
-- [Request Fields](#request-fields)
-- [Voice And Reference Audio](#voice-and-reference-audio)
+- [gRPC Synthesis](#grpc-synthesis)
+- [HTTP Control Plane](#http-control-plane)
 - [Local Overrides](#local-overrides)
 - [Client Fairness](#client-fairness)
 - [Timing Metrics](#timing-metrics)
@@ -23,18 +21,34 @@ model capacity between clients and limits how much work may wait in a queue.
 
 ## Overview
 
-- `POST /v1/responses` synthesizes text to WAV audio for any loaded model id.
+- `tts.v1.TTSService/Synthesize` streams raw PCM audio for any loaded model id.
 - Configured model ids can use `kokoro`, `voxcpm2`, or `nanovllm_voxcpm`.
-- Responses include base64 WAV audio, timing metrics, and backend metadata.
+- Streams contain ordered audio chunks followed by timing metrics and backend metadata.
 - Admin endpoints expose model state, runtime load/unload, queue state, and GPU memory.
 - Each loaded model has its own scheduler with weighted client fairness,
   configurable inflight capacity, and bounded waiting queues.
 
-## HTTP API
+## gRPC Synthesis
+
+The versioned contract lives in [`proto/tts/v1/tts.proto`](proto/tts/v1/tts.proto).
+One `SynthesisRequest` produces a server stream with:
+
+1. one `Started` event that defines the PCM format;
+2. ordered `AudioChunk` events with PCM S16LE bytes;
+3. one `Completed` event with final counts, metrics, and metadata.
+
+NanoVLLM-VoxCPM emits chunks while inference is running. Complete-only engines
+use the same RPC and stream their completed waveform in chunks. Reference audio
+is sent as binary WAV data, not base64. Clients that need fair scheduling send
+a stable opaque `fairness_key` for the same principal.
+
+There is no HTTP synthesis route. See [docs/api.md](docs/api.md) for request
+fields, error statuses, message limits, and binding guidance.
+
+## HTTP Control Plane
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /v1/responses` | Synthesize text to WAV audio through a loaded TTS model. |
 | `GET /v1/models` | List currently loaded model ids. |
 | `GET /v1/admin/models` | List configured model ids plus runtime state, queue state, capabilities, and definitions. |
 | `GET /v1/admin/gpu-memory` | Return current GPU memory usage plus per-model artifact estimates. |
@@ -46,140 +60,6 @@ See [docs/voxcpm2-optimization.md](docs/voxcpm2-optimization.md) for the current
 VoxCPM2 optimization findings and warmup configuration.
 See [docs/nanovllm-voxcpm-spike.md](docs/nanovllm-voxcpm-spike.md) for the
 current NanoVLLM-VoxCPM notes.
-
-## Synthesis Example
-
-Example request:
-
-```json
-{
-  "model": "voxcpm2",
-  "input": "Let's see if this works.",
-  "language": "English",
-  "fairness_key": "interactive-client",
-  "voice": {
-    "instructions": "Speak in English. Use a clear, natural voice.",
-    "reference_audio": {
-      "mime_type": "audio/wav",
-      "data_base64": "...",
-      "max_duration_s": 4
-    }
-  },
-  "format": {
-    "type": "wav"
-  },
-  "generation": {
-    "voxcpm2": {
-      "cfg_value": 2.0,
-      "inference_timesteps": 10,
-      "normalize": false,
-      "denoise": false
-    }
-  },
-  "stream": false
-}
-```
-
-Example response shape:
-
-```json
-{
-  "id": "ttsresp_123",
-  "object": "tts_response",
-  "model": "voxcpm2",
-  "audio": {
-    "mime_type": "audio/wav",
-    "data_base64": "...",
-    "sample_rate_hz": 48000,
-    "duration_ms": 1440
-  },
-  "metrics": {
-    "engine_queue_wait_ms": 0.0,
-    "backend_synthesis_wall_ms": 420.5,
-    "engine_total_wall_ms": 421.1,
-    "pool_total_wall_ms": 421.8,
-    "voxcpm2_generate_wall_ms": 410.2,
-    "output_audio_seconds": 1.44,
-    "realtime_factor": 0.29
-  },
-  "metadata": {
-    "engine": "voxcpm2",
-    "device": "cuda",
-    "reference_audio": true
-  }
-}
-```
-
-`stream: true` is intentionally rejected in the current version. The response
-contains base64 WAV audio so callers can stay stateless and remote-friendly.
-
-## Request Fields
-
-Currently supported API request fields:
-
-| Field | Type | Required | Default if omitted | Notes |
-| --- | --- | --- | --- | --- |
-| `model` | `string` | yes | none | Must match a currently loaded model id. |
-| `input` | `string` | yes | none | Text to synthesize. |
-| `language` | `string` | yes | none | Language label passed to the selected backend. |
-| `fairness_key` | `string \| null` | no | `null` | Stable client or work-category name. It is trimmed and limited to 128 characters. Requests without a key share one queue. |
-| `voice` | `object` | no | `{}` | Optional backend-specific voice id, instructions, and reference audio. |
-| `format.type` | `"wav"` | no | `"wav"` | WAV is the only supported output format. |
-| `generation` | `object` | no | `{}` | Backend-specific generation overrides. |
-| `stream` | `boolean` | no | `false` | `true` currently returns `400 stream_unsupported`. |
-
-`fairness_key` is used only for queueing inside `tts-pool`. The selected TTS
-backend never receives it. Use a small, stable set of keys; do not create a new
-key for every request.
-
-Kokoro generation fields:
-
-| Field | Type | Notes |
-| --- | --- | --- |
-| `generation.kokoro.speed` | `float \| null` | Optional temporary speed override for the request. |
-
-VoxCPM2 generation fields:
-
-| Field | Type | Notes |
-| --- | --- | --- |
-| `generation.voxcpm2.cfg_value` | `float \| null` | Classifier-free guidance value. |
-| `generation.voxcpm2.inference_timesteps` | `int \| null` | Diffusion sampling steps. |
-| `generation.voxcpm2.normalize` | `boolean \| null` | Request-level text normalization toggle. |
-| `generation.voxcpm2.denoise` | `boolean \| null` | Request-level denoise toggle for prompt/reference audio when denoiser support is loaded. |
-
-NanoVLLM-VoxCPM generation fields:
-
-| Field | Type | Notes |
-| --- | --- | --- |
-| `generation.nanovllm_voxcpm.cfg_value` | `float \| null` | Classifier-free guidance value. |
-| `generation.nanovllm_voxcpm.temperature` | `float \| null` | Sampling temperature. |
-| `generation.nanovllm_voxcpm.max_generate_length` | `int \| null` | Maximum generated token length. |
-
-## Voice And Reference Audio
-
-`voice.preset` is only for backends with native voice ids. Kokoro expects a
-voice id such as `af_heart`.
-
-VoxCPM2 and NanoVLLM-VoxCPM do not define service-level voice presets. Clients
-own the prompt wording and send the final control text through
-`voice.instructions`. Kokoro ignores `voice.instructions`.
-
-VoxCPM2 and NanoVLLM-VoxCPM support `voice.reference_audio`:
-
-```json
-{
-  "mime_type": "audio/wav",
-  "data_base64": "...",
-  "max_duration_s": 8
-}
-```
-
-Without `prompt_text`, the service clips reference WAV audio to the
-configured/requested maximum before passing it to the selected backend. When
-`prompt_text` is present, the service keeps the complete WAV so the transcript
-stays aligned with the audio. In that mode, `max_duration_s` does not limit the
-reference audio. If a client wants the model to follow the reference pace or
-articulation, that instruction belongs in `voice.instructions`.
 
 ## Local Overrides
 
@@ -198,7 +78,12 @@ Example local override:
 {
   "service": {
     "host": "127.0.0.1",
-    "port": 8020
+    "port": 8020,
+    "grpc": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8021
+    }
   },
   "engine": {
     "models": {
@@ -242,7 +127,8 @@ Notes:
   `local.json`.
 - `target_inflight` is configured per model id and applied through the scheduler.
 - The base dependencies include the VoxCPM2 backend package.
-- Kokoro dependencies are available through `pip install -e '.[kokoro]'`.
+- Additional Japanese and Chinese Kokoro language dependencies are available
+  through `pip install -e '.[kokoro]'`.
 
 ## Client Fairness
 
@@ -315,10 +201,10 @@ equal slot-time. A client can still use all slots when no other key is waiting.
 This is weighted fair sharing, not strict priority or a hard per-key concurrency
 limit.
 
-Queue limits count waiting work, not active requests. Rejections use HTTP `429`
-with code `fairness_key_queue_full` or `executor_queue_full`. Reference-audio
-base64 is separately limited to 16,777,216 characters before a request can
-enter a queue.
+Queue limits count waiting work, not active requests. Rejections use gRPC
+`RESOURCE_EXHAUSTED`. The `tts-error-code` trailing metadata contains
+`fairness_key_queue_full` or `executor_queue_full`. Binary reference audio is
+limited to 12,582,912 bytes before a request can enter a queue.
 
 `GET /v1/admin/models` shows active and waiting counts, configured weights, and
 rejection counters per key. Each key receives a separate share, so trusted
@@ -332,21 +218,22 @@ NanoVLLM capacity and fairness measurements.
 
 ## Timing Metrics
 
-The response `metrics` payload uses nested timers:
+The `Completed.metrics` payload uses nested timers:
 
 - `backend_synthesis_wall_ms`
   total wall time spent inside the selected TTS runtime
 - `engine_total_wall_ms`
   backend synthesis plus queueing, scheduling, and other engine work around it
-- `pool_total_wall_ms`
-  total time spent inside the `tts-pool` request handler
-
 The payload may also include runtime-specific counters and sub-timers:
 
 - `engine_queue_wait_ms`
   time spent waiting in the per-model scheduler queue
 - `engine_outside_backend_wall_ms`
   engine time not spent inside backend synthesis
+- `grpc_first_chunk_wall_ms`
+  time from RPC receipt until the first PCM chunk is handed to the transport
+- `grpc_stream_wall_ms`
+  time from RPC receipt until the completed stream event
 - `input_chars`
   input text length
 - `output_audio_seconds`
@@ -365,8 +252,6 @@ The payload may also include runtime-specific counters and sub-timers:
   NanoVLLM-VoxCPM async generation-loop time
 - `nanovllm_first_chunk_wall_ms`
   time to first generated audio chunk, comparable to TTFT for streaming LLMs
-- `nanovllm_wav_encode_ms`
-  WAV encoding time after NanoVLLM generation
 - `kokoro_pipeline_wall_ms`
   Kokoro pipeline consumption time
 
@@ -408,7 +293,7 @@ python3 -m unittest discover -s tests
 ```
 
 The live NanoVLLM benchmark exercises concurrent synthesis and client fairness
-through the HTTP API:
+through the gRPC data plane:
 
 ```bash
 .venv/bin/python scripts/tts_pool_fairness_bench.py \

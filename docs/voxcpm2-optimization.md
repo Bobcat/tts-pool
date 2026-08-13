@@ -248,9 +248,9 @@ Current implementation:
   latency gains from that alone.
 - Consider prompt/reference cache reuse if we later synthesize multiple chunks
   from the same reference sample.
-- Implement streaming or chunked TTS for UX. This is likely more important than
-  more raw backend speed, because the current `/v1/responses` path only returns
-  once the full WAV is generated.
+- Native VoxCPM2 streaming remains a separate runtime improvement. The gRPC
+  transport already emits complete VoxCPM2 output as PCM chunks, but the first
+  chunk still waits for that runtime to finish inference.
 
 ## Risks And Caveats
 

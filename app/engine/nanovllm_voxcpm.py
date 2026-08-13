@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import io
 import logging
 from pathlib import Path
 import tempfile
 import threading
 import time
 from typing import Any
+from typing import Awaitable
+from typing import Callable
+import wave
 
 from app.config import ModelSettings
 from app.config import NanoVLLMWarmupCase
@@ -14,11 +19,13 @@ from app.schemas import EngineResult
 from app.schemas import ResponseRequest
 
 from .common import decode_reference_audio
+from .streaming import RuntimeStreamResult
+from .streaming import SynthesisCancelled
+from .streaming import SynthesisHandle
 from .voxcpm2 import _copy_wav_tail
 from .voxcpm2 import _prompt_text_for_request
 from .voxcpm2 import _ultimate_use_reference_for_request
 from .voxcpm2 import _voxcpm2_text
-from .voxcpm2 import _wav_bytes
 from .voxcpm2 import _wav_duration_ms
 from .voxcpm2 import _write_warmup_reference_wav
 
@@ -43,7 +50,20 @@ DEFAULT_WARMUP_CASES = (
 )
 
 
+@dataclass(frozen=True)
+class _PreparedSynthesis:
+    started_at: float
+    text: str
+    control: str
+    reference_wav: bytes | None
+    reference_metadata: dict[str, Any]
+    reference_prepare_ms: float
+    sample_rate_hz: int
+
+
 class NanoVLLMVoxCPMTTSRuntime:
+    max_stream_chunk_bytes = 64 * 1024
+
     def __init__(self, *, model_name: str, model_settings: ModelSettings) -> None:
         self.model_name = model_name
         self.model_settings = model_settings
@@ -79,26 +99,95 @@ class NanoVLLMVoxCPMTTSRuntime:
     def synthesize(self, request: ResponseRequest) -> EngineResult:
         if self._server is None:
             raise RuntimeError("NanoVLLM VoxCPM model is not loaded")
+        prepared = self._prepare_synthesis(request)
+        pcm_chunks: list[bytes] = []
+
+        async def started_sink(_: int) -> None:
+            return
+
+        async def chunk_sink(_: int, __: int, pcm: bytes) -> None:
+            pcm_chunks.append(pcm)
+
+        result = self._run_on_loop(
+            self._generate_pcm_async(
+                request=request,
+                prepared=prepared,
+                started_sink=started_sink,
+                chunk_sink=chunk_sink,
+                cancelled=lambda: False,
+            )
+        )
+        encode_started = time.perf_counter()
+        audio = _pcm_wav_bytes(b"".join(pcm_chunks), sample_rate_hz=prepared.sample_rate_hz)
+        metrics = dict(result.metrics)
+        metrics["nanovllm_wav_encode_ms"] = (time.perf_counter() - encode_started) * 1000.0
+        metrics["nanovllm_total_wall_ms"] = (time.perf_counter() - prepared.started_at) * 1000.0
+        audio_seconds = result.total_sample_count / float(prepared.sample_rate_hz)
+        metrics["realtime_factor"] = (
+            (float(metrics["nanovllm_total_wall_ms"]) / 1000.0) / audio_seconds
+            if audio_seconds > 0
+            else 0.0
+        )
+        return EngineResult(
+            audio=audio,
+            mime_type="audio/wav",
+            sample_rate_hz=prepared.sample_rate_hz,
+            duration_ms=result.duration_ms,
+            metrics=metrics,
+            metadata=result.metadata,
+        )
+
+    def synthesize_stream(self, request: ResponseRequest, handle: SynthesisHandle) -> RuntimeStreamResult:
+        if self._server is None:
+            raise RuntimeError("NanoVLLM VoxCPM model is not loaded")
+        prepared = self._prepare_synthesis(request)
+        if handle.cancelled:
+            raise SynthesisCancelled("synthesis was cancelled before reference encoding")
+
+        async def started_sink(sample_rate_hz: int) -> None:
+            handle.emit_started(sample_rate_hz=sample_rate_hz)
+
+        async def chunk_sink(sequence_number: int, first_sample: int, pcm: bytes) -> None:
+            await asyncio.to_thread(
+                handle.emit_audio,
+                sequence_number=sequence_number,
+                first_sample=first_sample,
+                pcm=pcm,
+            )
+
+        return self._run_on_loop(
+            self._generate_pcm_async(
+                request=request,
+                prepared=prepared,
+                started_sink=started_sink,
+                chunk_sink=chunk_sink,
+                cancelled=lambda: handle.cancelled,
+            )
+        )
+
+    def _prepare_synthesis(
+        self,
+        request: ResponseRequest,
+    ) -> _PreparedSynthesis:
         started_at = time.perf_counter()
         control = self._control_for_request(request)
-        # See voxcpm2.py: drop the (control)-prefix when ultimate
-        # cloning is on, otherwise VoxCPM2 narrates it literally.
         if _prompt_text_for_request(request):
             control = ""
         text = _voxcpm2_text(request.input, control)
         reference_started_at = time.perf_counter()
         reference_wav, reference_metadata = self._reference_wav(request)
         reference_prepare_ms = (time.perf_counter() - reference_started_at) * 1000.0
-        return self._run_on_loop(
-            self._synthesize_async(
-                request=request,
-                started_at=started_at,
-                text=text,
-                control=control,
-                reference_wav=reference_wav,
-                reference_metadata=reference_metadata,
-                reference_prepare_ms=reference_prepare_ms,
-            )
+        sample_rate_hz = int(self._model_info.get("sample_rate") or 0)
+        if sample_rate_hz <= 0:
+            raise ValueError("NanoVLLM VoxCPM model did not expose a valid sample rate")
+        return _PreparedSynthesis(
+            started_at=started_at,
+            text=text,
+            control=control,
+            reference_wav=reference_wav,
+            reference_metadata=reference_metadata,
+            reference_prepare_ms=reference_prepare_ms,
+            sample_rate_hz=sample_rate_hz,
         )
 
     async def _load_async(self) -> None:
@@ -120,27 +209,31 @@ class NanoVLLMVoxCPMTTSRuntime:
         self._model_info = _model_info_dict(await self._server.get_model_info())
         await self._warmup_async()
 
-    async def _synthesize_async(
+    async def _generate_pcm_async(
         self,
         *,
         request: ResponseRequest,
-        started_at: float,
-        text: str,
-        control: str,
-        reference_wav: bytes | None,
-        reference_metadata: dict[str, Any],
-        reference_prepare_ms: float,
-    ) -> EngineResult:
+        prepared: _PreparedSynthesis,
+        started_sink: Callable[[int], Awaitable[None]],
+        chunk_sink: Callable[[int, int, bytes], Awaitable[None]],
+        cancelled: Callable[[], bool],
+    ) -> RuntimeStreamResult:
         server = self._server
         if server is None:
             raise RuntimeError("NanoVLLM VoxCPM model is not loaded")
 
+        if cancelled():
+            raise SynthesisCancelled("synthesis was cancelled before generation")
+        await started_sink(prepared.sample_rate_hz)
+
         reference_latents: bytes | None = None
         reference_encode_ms = 0.0
-        if reference_wav is not None:
+        if prepared.reference_wav is not None:
             encode_started = time.perf_counter()
-            reference_latents = await server.encode_latents(reference_wav, "wav")
+            reference_latents = await server.encode_latents(prepared.reference_wav, "wav")
             reference_encode_ms = (time.perf_counter() - encode_started) * 1000.0
+        if cancelled():
+            raise SynthesisCancelled("synthesis was cancelled after reference encoding")
 
         generation = request.generation.nanovllm_voxcpm
         cfg_value = (
@@ -169,13 +262,13 @@ class NanoVLLMVoxCPMTTSRuntime:
         ultimate_use_reference = (
             prompt_text is not None and _ultimate_use_reference_for_request(request)
         )
-        reference_metadata["ultimate_cloning"] = bool(prompt_text)
-        reference_metadata["ultimate_cloning_with_reference"] = bool(ultimate_use_reference)
+        prepared.reference_metadata["ultimate_cloning"] = bool(prompt_text)
+        prepared.reference_metadata["ultimate_cloning_with_reference"] = bool(ultimate_use_reference)
         include_ref_latents = reference_latents is not None and (
             not prompt_text or ultimate_use_reference
         )
         generate_kwargs: dict[str, Any] = {
-            "target_text": text,
+            "target_text": prepared.text,
             "max_generate_length": max_generate_length,
             "temperature": temperature,
             "cfg_value": cfg_value,
@@ -186,26 +279,37 @@ class NanoVLLMVoxCPMTTSRuntime:
             generate_kwargs["prompt_latents"] = reference_latents
             generate_kwargs["prompt_text"] = prompt_text
 
-        chunks: list[Any] = []
         first_chunk_ms: float | None = None
+        chunk_count = 0
+        total_sample_count = 0
         generate_started = time.perf_counter()
-        async for chunk in server.generate(**generate_kwargs):
-            if first_chunk_ms is None:
-                first_chunk_ms = (time.perf_counter() - generate_started) * 1000.0
-            chunks.append(np.asarray(chunk, dtype=np.float32).reshape(-1))
+        chunks = server.generate(**generate_kwargs)
+        try:
+            async for chunk in chunks:
+                if cancelled():
+                    raise SynthesisCancelled("synthesis was cancelled during generation")
+                if first_chunk_ms is None:
+                    first_chunk_ms = (time.perf_counter() - generate_started) * 1000.0
+                samples = np.asarray(chunk, dtype=np.float32).reshape(-1)
+                samples = np.clip(samples, -1.0, 1.0)
+                pcm = (samples * 32767.0).astype("<i2", copy=False).tobytes()
+                await chunk_sink(chunk_count, total_sample_count, pcm)
+                chunk_count += 1
+                total_sample_count += len(samples)
+        finally:
+            close = getattr(chunks, "aclose", None)
+            if callable(close):
+                await close()
         generate_wall_ms = (time.perf_counter() - generate_started) * 1000.0
-        if not chunks:
+        if chunk_count == 0:
             raise ValueError("NanoVLLM VoxCPM returned no audio chunks")
 
-        encode_started = time.perf_counter()
-        sample_rate_hz = int(self._model_info.get("sample_rate") or 0)
-        if sample_rate_hz <= 0:
-            raise ValueError("NanoVLLM VoxCPM model did not expose a valid sample rate")
-        wav_bytes, duration_ms, audio_seconds = _wav_bytes(np.concatenate(chunks), sample_rate_hz=sample_rate_hz)
-        wav_encode_ms = (time.perf_counter() - encode_started) * 1000.0
-        total_wall_ms = (time.perf_counter() - started_at) * 1000.0
+        audio_seconds = total_sample_count / float(prepared.sample_rate_hz)
+        duration_ms = int(audio_seconds * 1000.0)
+        total_wall_ms = (time.perf_counter() - prepared.started_at) * 1000.0
         metadata = {
             "engine": "nanovllm_voxcpm",
+            "native_streaming": True,
             "model_id": self.model_settings.nanovllm_model_id,
             "language": request.language,
             "devices": list(self.model_settings.nanovllm_devices),
@@ -213,22 +317,20 @@ class NanoVLLMVoxCPMTTSRuntime:
             "temperature": temperature,
             "inference_timesteps": self.model_settings.nanovllm_inference_timesteps,
             "max_generate_length": max_generate_length,
-            "control": control,
-            **reference_metadata,
+            "control": prepared.control,
+            **prepared.reference_metadata,
         }
-        return EngineResult(
-            audio=wav_bytes,
-            mime_type="audio/wav",
-            sample_rate_hz=sample_rate_hz,
+        return RuntimeStreamResult(
+            total_sample_count=total_sample_count,
             duration_ms=duration_ms,
+            chunk_count=chunk_count,
             metrics={
                 "nanovllm_total_wall_ms": total_wall_ms,
-                "nanovllm_reference_prepare_wall_ms": reference_prepare_ms,
+                "nanovllm_reference_prepare_wall_ms": prepared.reference_prepare_ms,
                 "nanovllm_reference_encode_wall_ms": reference_encode_ms,
                 "nanovllm_generate_wall_ms": generate_wall_ms,
                 "nanovllm_first_chunk_wall_ms": first_chunk_ms,
-                "nanovllm_wav_encode_ms": wav_encode_ms,
-                "nanovllm_chunks": len(chunks),
+                "nanovllm_chunks": chunk_count,
                 "input_chars": len(request.input),
                 "output_audio_seconds": audio_seconds,
                 "realtime_factor": (total_wall_ms / 1000.0) / audio_seconds if audio_seconds > 0 else 0.0,
@@ -401,3 +503,13 @@ def _model_info_dict(model_info: Any) -> dict[str, Any]:
     if hasattr(model_info, "_asdict"):
         return dict(model_info._asdict())
     return dict(getattr(model_info, "__dict__", {}))
+
+
+def _pcm_wav_bytes(pcm: bytes, *, sample_rate_hz: int) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate_hz)
+        writer.writeframes(pcm)
+    return buffer.getvalue()

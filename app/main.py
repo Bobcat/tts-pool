@@ -1,12 +1,7 @@
 from __future__ import annotations
 
-import base64
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-import json
-import logging
-import time
-import uuid
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -15,50 +10,34 @@ from fastapi import HTTPException
 from app.config import load_settings
 from app.engine import build_engine
 from app.engine import ModelStateError
-from app.engine import RequestAdmissionError
 from app.engine import UnknownModelError
+from app.grpc_api.server import GrpcServer
 from app.schemas import AdminGpuMemoryEnvelope
 from app.schemas import AdminLoadRequest
 from app.schemas import AdminModelEntry
 from app.schemas import AdminModelsEnvelope
-from app.schemas import AudioOutput
-from app.schemas import ResponseEnvelope
-from app.schemas import ResponseRequest
-
-
-LOGGER = logging.getLogger("tts_pool.metrics")
-
-
-def _metrics_payload(metrics: dict[str, float | int | None]) -> dict[str, float | int | None]:
-    return dict(metrics)
-
-
-def _log_inference(response_id: str, request: ResponseRequest, metrics: dict[str, float | int | None]) -> None:
-    payload = {
-        "event": "tts_pool.inference",
-        "request_id": response_id,
-        "model": request.model,
-        "fairness_key": request.fairness_key,
-        "stream": request.stream,
-        "metrics": _metrics_payload(metrics),
-    }
-    LOGGER.info("%s", json.dumps(payload, ensure_ascii=True, sort_keys=True))
 
 
 def create_app(settings_path: str | Path | None = None) -> FastAPI:
     settings = load_settings(settings_path)
     engine = build_engine(settings)
+    grpc_server = GrpcServer(settings=settings.service.grpc, engine=engine) if settings.service.grpc.enabled else None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
+            if grpc_server is not None:
+                await grpc_server.start()
             yield
         finally:
+            if grpc_server is not None:
+                await grpc_server.stop()
             close = getattr(engine, "close", None)
             if callable(close):
                 close()
 
     app = FastAPI(title="TTS Pool API", lifespan=lifespan)
+    app.state.grpc_server = grpc_server
 
     @app.get("/v1/models")
     def list_models() -> dict[str, object]:
@@ -126,56 +105,11 @@ def create_app(settings_path: str | Path | None = None) -> FastAPI:
                 status_code=409,
                 detail={"code": exc.code, "model": model_name},
             ) from exc
-
-    @app.post("/v1/responses", response_model=ResponseEnvelope)
-    def create_response(request: ResponseRequest) -> ResponseEnvelope:
-        if request.stream:
-            raise HTTPException(status_code=400, detail={"code": "stream_unsupported"})
-        started_at = time.perf_counter()
-        response_id = f"ttsresp_{uuid.uuid4().hex}"
-        try:
-            result = engine.complete(request)
-        except UnknownModelError as exc:
-            raise HTTPException(
-                status_code=404,
-                detail={"code": "unknown_model", "model": request.model},
-            ) from exc
-        except ModelStateError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": exc.code, "model": request.model},
-            ) from exc
-        except RequestAdmissionError as exc:
-            raise HTTPException(
-                status_code=exc.status_code,
-                detail={"code": exc.code, "message": exc.message},
-            ) from exc
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "invalid_request", "message": str(exc)},
-            ) from exc
         except RuntimeError as exc:
             raise HTTPException(
                 status_code=500,
-                detail={"code": "synthesis_failed", "model": request.model, "message": str(exc)},
+                detail={"code": "model_unload_failed", "model": model_name, "message": str(exc)},
             ) from exc
-
-        metrics = dict(result.metrics)
-        metrics["pool_total_wall_ms"] = max(0.0, (time.perf_counter() - started_at) * 1000.0)
-        _log_inference(response_id, request, metrics)
-        return ResponseEnvelope(
-            id=response_id,
-            model=request.model,
-            audio=AudioOutput(
-                mime_type=result.mime_type,
-                data_base64=base64.b64encode(result.audio).decode("ascii"),
-                sample_rate_hz=result.sample_rate_hz,
-                duration_ms=result.duration_ms,
-            ),
-            metrics=metrics,
-            metadata=result.metadata,
-        )
 
     return app
 

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from concurrent.futures import Future
 import heapq
+import io
 import threading
 import time
 import unittest
 from unittest import mock
+import wave
 
 from app.config import AppSettings
 from app.config import EngineSettings
@@ -16,8 +17,14 @@ from app.engine.common import RequestAdmissionError
 from app.engine.scheduler import _FairPendingQueue
 from app.engine.scheduler import LoadedModelExecutor
 from app.engine.router import TTSRouterEngine
+from app.engine.streaming import RuntimeStreamResult
+from app.engine.streaming import StreamAudioChunk
+from app.engine.streaming import StreamCompleted
+from app.engine.streaming import StreamStarted
+from app.engine.streaming import SynthesisCancelled
+from app.engine.streaming import SynthesisHandle
 from app.schemas import EngineResult
-from app.schemas import MAX_REFERENCE_AUDIO_BASE64_CHARS
+from app.schemas import MAX_REFERENCE_AUDIO_BYTES
 from app.schemas import ReferenceAudio
 from app.schemas import ResponseRequest
 
@@ -32,7 +39,23 @@ def _request(*, key: str | None, text: str) -> ResponseRequest:
 
 
 def _result() -> EngineResult:
-    return EngineResult(audio=b"wav", sample_rate_hz=16000, duration_ms=1)
+    output = io.BytesIO()
+    with wave.open(output, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16_000)
+        writer.writeframes(b"\x00\x00")
+    return EngineResult(audio=output.getvalue(), sample_rate_hz=16000, duration_ms=1)
+
+
+def _handle() -> SynthesisHandle:
+    return SynthesisHandle(
+        response_id="ttsresp_test",
+        model_name="test-model",
+        max_buffer_chunks=4,
+        max_buffer_bytes=1024,
+        stalled_consumer_timeout_s=1.0,
+    )
 
 
 class RequestFairnessContractTests(unittest.TestCase):
@@ -55,9 +78,9 @@ class RequestFairnessContractTests(unittest.TestCase):
                     fairness_key=value,
                 )
 
-    def test_reference_audio_base64_length_is_bounded(self) -> None:
+    def test_reference_audio_byte_length_is_bounded(self) -> None:
         with self.assertRaises(Exception):
-            ReferenceAudio(data_base64="x" * (MAX_REFERENCE_AUDIO_BASE64_CHARS + 1))
+            ReferenceAudio(data=b"x" * (MAX_REFERENCE_AUDIO_BYTES + 1))
 
 
 class FairPendingQueueTests(unittest.TestCase):
@@ -77,7 +100,7 @@ class FairPendingQueueTests(unittest.TestCase):
     ) -> None:
         queue.enqueue(
             request=_request(key=key, text=text),
-            result_future=Future[EngineResult](),
+            stream_handle=_handle(),
             now=now,
         )
 
@@ -276,6 +299,117 @@ class FairPendingQueueTests(unittest.TestCase):
 
 
 class LoadedModelExecutorFairnessTests(unittest.TestCase):
+    def test_stream_job_uses_executor_and_reports_scheduler_metrics(self) -> None:
+        def stream(_: ResponseRequest, handle: SynthesisHandle) -> RuntimeStreamResult:
+            handle.emit_started(sample_rate_hz=16_000)
+            handle.emit_audio(sequence_number=0, first_sample=0, pcm=b"\x00\x00")
+            return RuntimeStreamResult(
+                total_sample_count=1,
+                duration_ms=1,
+                chunk_count=1,
+                metrics={"runtime_ms": 1.0},
+                metadata={"engine": "test"},
+            )
+
+        executor = LoadedModelExecutor(
+            model_name="test-model",
+            complete_fn=lambda _: _result(),
+            stream_fn=stream,
+            configured_target_inflight=1,
+            runtime_capability=1,
+            fairness_settings=FairnessSettings(),
+        )
+        executor.start()
+        handle = _handle()
+        try:
+            executor.enqueue_stream(_request(key="a", text="stream"), handle)
+            events = [handle.read_event(), handle.read_event(), handle.read_event()]
+
+            self.assertIsInstance(events[0], StreamStarted)
+            self.assertIsInstance(events[1], StreamAudioChunk)
+            self.assertIsInstance(events[2], StreamCompleted)
+            self.assertIn("engine_queue_wait_ms", events[2].metrics)
+            self.assertIn("backend_synthesis_wall_ms", events[2].metrics)
+            self.assertIn("engine_total_wall_ms", events[2].metrics)
+        finally:
+            executor.begin_shutdown()
+            executor.join(timeout=1.0)
+
+    def test_queued_stream_cancellation_removes_job(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def complete(_: ResponseRequest) -> EngineResult:
+            entered.set()
+            release.wait(timeout=1.0)
+            return _result()
+
+        executor = LoadedModelExecutor(
+            model_name="test-model",
+            complete_fn=complete,
+            configured_target_inflight=1,
+            runtime_capability=1,
+            fairness_settings=FairnessSettings(),
+        )
+        executor.start()
+        active = _handle()
+        executor.enqueue_stream(_request(key="a", text="active"), active)
+        self.assertTrue(entered.wait(timeout=1.0))
+        handle = _handle()
+        try:
+            executor.enqueue_stream(_request(key="b", text="pending"), handle)
+            self.assertEqual(executor.snapshot().queue_depth, 1)
+
+            handle.cancel()
+
+            with self.assertRaises(SynthesisCancelled):
+                handle.read_event()
+            self.assertEqual(executor.snapshot().queue_depth, 0)
+        finally:
+            release.set()
+            self.assertIsInstance(active.read_event(), StreamStarted)
+            self.assertIsInstance(active.read_event(), StreamAudioChunk)
+            self.assertIsInstance(active.read_event(), StreamCompleted)
+            executor.begin_shutdown()
+            executor.join(timeout=1.0)
+
+    def test_active_stream_cancellation_releases_runtime_slot(self) -> None:
+        entered = threading.Event()
+
+        def stream(_: ResponseRequest, handle: SynthesisHandle) -> RuntimeStreamResult:
+            handle.emit_started(sample_rate_hz=16_000)
+            entered.set()
+            while not handle.cancelled:
+                time.sleep(0.005)
+            raise SynthesisCancelled("cancelled in runtime")
+
+        executor = LoadedModelExecutor(
+            model_name="test-model",
+            complete_fn=lambda _: _result(),
+            stream_fn=stream,
+            configured_target_inflight=1,
+            runtime_capability=1,
+            fairness_settings=FairnessSettings(),
+        )
+        executor.start()
+        handle = _handle()
+        try:
+            executor.enqueue_stream(_request(key="a", text="active"), handle)
+            self.assertTrue(entered.wait(timeout=1.0))
+            self.assertIsInstance(handle.read_event(), StreamStarted)
+
+            handle.cancel()
+
+            with self.assertRaises(SynthesisCancelled):
+                handle.read_event()
+            deadline = time.monotonic() + 1.0
+            while executor.snapshot().runtime_inflight and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual(executor.snapshot().runtime_inflight, 0)
+        finally:
+            executor.begin_shutdown()
+            executor.join(timeout=1.0)
+
     def test_backend_failure_is_charged_and_releases_slot(self) -> None:
         def fail(_: ResponseRequest) -> EngineResult:
             time.sleep(0.01)
@@ -290,9 +424,10 @@ class LoadedModelExecutorFairnessTests(unittest.TestCase):
         )
         executor.start()
         try:
-            future = executor.enqueue(_request(key="a", text="fail"))
+            handle = _handle()
+            executor.enqueue_stream(_request(key="a", text="fail"), handle)
             with self.assertRaisesRegex(RuntimeError, "backend failed"):
-                future.result(timeout=1.0)
+                handle.read_event()
 
             self.assertEqual(executor.snapshot().runtime_inflight, 0)
             score = executor._pending_queue.score("a", now=time.perf_counter())
@@ -316,9 +451,10 @@ class LoadedModelExecutorFairnessTests(unittest.TestCase):
                 "app.engine.scheduler.threading.Thread",
                 side_effect=RuntimeError("thread start failed"),
             ):
-                future = executor.enqueue(_request(key="a", text="fail"))
+                handle = _handle()
+                executor.enqueue_stream(_request(key="a", text="fail"), handle)
                 with self.assertRaisesRegex(RuntimeError, "thread start failed"):
-                    future.result(timeout=1.0)
+                    handle.read_event()
 
             self.assertEqual(executor.snapshot().runtime_inflight, 0)
             self.assertEqual(
@@ -346,19 +482,23 @@ class LoadedModelExecutorFairnessTests(unittest.TestCase):
             fairness_settings=FairnessSettings(),
         )
         executor.start()
-        first = executor.enqueue(_request(key="a", text="active"))
+        first = _handle()
+        executor.enqueue_stream(_request(key="a", text="active"), first)
         self.assertTrue(entered.wait(timeout=1.0))
-        pending_a = executor.enqueue(_request(key="a", text="pending-a"))
-        pending_b = executor.enqueue(_request(key="b", text="pending-b"))
+        pending_a = _handle()
+        pending_b = _handle()
+        executor.enqueue_stream(_request(key="a", text="pending-a"), pending_a)
+        executor.enqueue_stream(_request(key="b", text="pending-b"), pending_b)
 
         executor.begin_shutdown()
-        for future in (pending_a, pending_b):
+        for handle in (pending_a, pending_b):
             with self.assertRaises(ModelStateError) as error:
-                future.result(timeout=1.0)
+                handle.read_event()
             self.assertEqual(error.exception.code, "model_unloading")
+        with self.assertRaises(SynthesisCancelled):
+            first.read_event()
 
         release.set()
-        self.assertEqual(first.result(timeout=1.0).audio, b"wav")
         executor.join(timeout=1.0)
         self.assertEqual(executor.snapshot().queue_depth, 0)
         self.assertFalse(executor.snapshot().accepting_new_requests)
@@ -419,26 +559,9 @@ class RouterFairnessTests(unittest.TestCase):
         ):
             engine = TTSRouterEngine(settings)
 
-        results: list[EngineResult] = []
-        errors: list[Exception] = []
-
-        def complete(request: ResponseRequest) -> None:
-            try:
-                results.append(engine.complete(request))
-            except Exception as exc:
-                errors.append(exc)
-
-        active_thread = threading.Thread(
-            target=complete,
-            args=(_request(key="a", text="active"),),
-        )
-        pending_thread = threading.Thread(
-            target=complete,
-            args=(_request(key="b", text="pending"),),
-        )
-        active_thread.start()
+        active = engine.stream(_request(key="a", text="active"))
         self.assertTrue(entered.wait(timeout=1.0))
-        pending_thread.start()
+        pending = engine.stream(_request(key="b", text="pending"))
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline:
             if engine.admin_models_payload()["models"][0]["queue_depth"] == 1:
@@ -463,11 +586,11 @@ class RouterFairnessTests(unittest.TestCase):
         )
 
         release.set()
-        active_thread.join(timeout=1.0)
-        pending_thread.join(timeout=1.0)
+        for handle in (active, pending):
+            self.assertIsInstance(handle.read_event(), StreamStarted)
+            self.assertIsInstance(handle.read_event(), StreamAudioChunk)
+            self.assertIsInstance(handle.read_event(), StreamCompleted)
         engine.close()
-        self.assertEqual(len(results), 2)
-        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

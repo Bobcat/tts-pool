@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import base64
 import logging
 from pathlib import Path
 import subprocess
@@ -61,10 +60,7 @@ def decode_reference_audio(reference_audio: ReferenceAudio) -> bytes:
     mime_type = str(reference_audio.mime_type or "").strip().lower()
     if mime_type not in {"audio/wav", "audio/x-wav", "audio/wave"}:
         raise ValueError(f"unsupported reference_audio mime_type: {reference_audio.mime_type!r}")
-    try:
-        return base64.b64decode(reference_audio.data_base64, validate=True)
-    except Exception as exc:
-        raise ValueError("reference_audio.data_base64 is not valid base64") from exc
+    return reference_audio.decoded_bytes()
 
 
 def estimate_model_artifact_size_mib(model_path: str) -> int | None:
@@ -306,6 +302,6 @@ def capabilities_for_backend(backend: str, model_settings: ModelSettings) -> dic
                     "default": model_settings.nanovllm_max_generate_length,
                 },
             },
-            "streaming": False,
+            "streaming": True,
         }
     return {"output_formats": ["wav"], "streaming": False}
