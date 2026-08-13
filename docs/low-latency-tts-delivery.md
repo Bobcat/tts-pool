@@ -1,487 +1,395 @@
-# Low-Latency TTS Delivery
+# TTS-pool Low-Latency Streaming Architecture
 
-Status: design proposal. The transport benchmark must select the streaming
-mechanism before implementation starts.
+Status: implementation design. The transport is `grpc.aio`.
 
 ## Goal
 
-Make speech start as soon as possible after a user presses `Speak`.
+TTS-pool must serve clients that need audio before synthesis has completed.
+The first usable NanoVLLM chunk should leave TTS-pool without waiting for a
+complete WAV.
 
-The design has two complementary paths:
+The refactor must preserve:
 
-1. prepare likely speech before the click and buffer it in the browser;
-2. stream a cache miss from NanoVLLM to the browser without waiting for a
-   complete WAV.
+- the existing fair scheduler;
+- one capacity boundary per loaded model;
+- the existing complete-response HTTP API;
+- model load, unload, and inspection behavior;
+- complete WAV output for non-streaming callers.
 
-Prepared audio should normally start from a local browser buffer. A cache miss
-should start after the first usable model audio chunk plus transport and
-playback buffering. The complete WAV remains useful for replay and caching, but
-must not block first audio.
+The new interface adds binary reference input, incremental PCM output,
+backpressure, and cancellation.
 
-This is an end-to-end property. TTS-pool, the app backend, and the frontend each
-own part of the latency path.
+## Measured Opportunity
 
-## Evidence
+The loaded NanoVLLM-VoxCPM runtime already yields waveform chunks during
+generation. TTS-pool currently collects every chunk before it encodes and
+returns a WAV.
 
-NanoVLLM-VoxCPM already produces waveform chunks during generation. The current
-TTS-pool backend collects those chunks before returning a response.
+Warm measurements for about 10.24 seconds of generated audio were:
 
-The live scheduler test measured these warm results for output containing about
-10.24 seconds of audio:
+| Active sequences | First NanoVLLM chunk | Complete synthesis |
+| ---: | ---: | ---: |
+| 1 | 62.8-65.4 ms | 938.4-938.9 ms |
+| 2 | 62.5-69.6 ms | 1,060.0-1,084.4 ms |
+| 4 | 67.3-75.9 ms | 1,290.3-1,324.0 ms |
 
-| Runtime load | First internal chunk | Complete backend request |
-| --- | ---: | ---: |
-| One request | 62.8-65.4 ms | 938.4-938.9 ms |
-| Two requests | 62.5-69.6 ms | 1,060.0-1,084.4 ms |
-| Four requests | 67.3-75.9 ms | 1,290.3-1,324.0 ms |
-
-Reference encoding was 7.5-17.2 ms in the paired-reference tests. See
+Streaming can expose roughly 0.9-1.25 seconds of audio-production time that is
+currently hidden behind complete-response assembly. See
 [Scheduler and NanoVLLM Load Test](tts-scheduler-load-test.md).
 
-The backend therefore has usable audio roughly 0.9-1.25 seconds before the
-current API returns the complete result. Streaming can expose that interval to
-the caller. Pre-generation can remove the generation interval from the click
-path entirely.
+## Service Shape
 
-## Current Path
+One TTS-pool process owns:
 
-### Browser and app
+- the loaded runtimes;
+- the model executors;
+- the fairness scheduler state;
+- the existing FastAPI HTTP server;
+- one `grpc.aio` server for low-latency synthesis.
 
-Voice sessions use one WebSocket in both directions:
+Both network servers must use the same `TTSRouterEngine` instance. Starting a
+separate process for gRPC would create a second scheduler and load another model
+instance, so that is not the target architecture.
 
-- the browser sends binary PCM microphone audio;
-- the browser sends JSON controls such as `speak_now`, `speak_part`, and
-  `tts_playback_complete`;
-- the app pushes transcript, turn, status, and `tts_clip_ready` JSON events.
-
-There is no frontend polling in the voice workflow. After `tts_clip_ready`, the
-browser retrieves the complete WAV from an app HTTP artifact URL and queues it
-for playback.
-
-### App and TTS-pool
-
-The app sends one synchronous HTTP `POST /v1/responses` per speech bubble. The
-request is JSON. Optional reference audio is base64 text inside that JSON.
-
-TTS-pool currently:
-
-1. admits the request through the model executor scheduler;
-2. waits for every NanoVLLM waveform chunk;
-3. concatenates the chunks;
-4. encodes a complete WAV;
-5. base64-encodes the WAV in a JSON response.
-
-The app decodes the response, writes the WAV to disk, pushes `tts_clip_ready`,
-and lets the browser retrieve the artifact. The `stream` request field exists,
-but `stream=true` is rejected.
-
-## Target Flow
-
-### Prepared bubble
+The FastAPI lifespan starts and stops the gRPC server. Uvicorn continues to
+serve the current HTTP API. The gRPC server listens on its own configured port.
+Both ports remain part of one systemd service.
 
 ```text
-final translated bubble
-    -> app submits TTS before Speak
-    -> TTS-pool generates audio
-    -> app assembles and caches the WAV
-    -> app tells the browser that audio is prepared
-    -> browser fetches and buffers the audio
-    -> user presses Speak
-    -> browser starts the local buffer
+HTTP complete request ─┐
+                      ├─> TTSRouterEngine ─> LoadedModelExecutor ─> runtime
+gRPC stream request ──┘                              │
+                                                    └─> fair pending queue
 ```
 
-Generation and browser transfer happen before the user action. The click still
-notifies the app so the server can close the ASR scope, update the turn state,
-and track playback completion.
+## Transport
 
-### Cache miss
+Use one unary-request, server-streaming gRPC method:
 
 ```text
-user presses Speak
-    -> app starts or joins synthesis
-    -> TTS-pool emits the first NanoVLLM chunk
-    -> app forwards the chunk
-    -> browser starts buffered PCM playback
-    -> later chunks continue while audio plays
-    -> app also assembles the complete WAV
+TTSService.Synthesize(SynthesisRequest) returns (stream SynthesisEvent)
 ```
 
-No layer waits for a complete WAV before forwarding the first chunk.
+`grpc.aio` supplies HTTP/2 multiplexing, per-stream flow control, deadlines,
+cancellation, and binary messages. A client can send concurrent RPCs over one
+long-lived channel.
 
-### Several bubbles
+The transport measurements are recorded in
+[TTS Streaming Transport Benchmark](tts-transport-benchmark.md).
 
-Synthesis completion order does not determine playback order. The app and
-frontend retain the order of the selected turn parts.
+## Protobuf Contract
 
-The first prepared bubble may start immediately while later bubbles are still
-being generated or transferred. Each later bubble must be ready before the
-previous bubble finishes to avoid an audible gap.
+The versioned schema lives under `proto/tts/v1/`. Generated Python modules are
+checked in so service startup does not require a compiler.
 
-## Prepared-Audio Identity
+### Request
 
-Prepared audio is valid only for the exact synthesis input that produced it.
-An app-side cache key must include:
+`SynthesisRequest` contains:
 
-- turn ID and part ID;
-- exact target text;
-- target language;
-- selected TTS model;
-- normalized TTS generation settings;
-- voice mode and instructions;
-- reference-audio identity or digest;
-- reference prompt text when present.
+- model name;
+- target text;
+- language;
+- trusted `fairness_key`;
+- voice preset or instructions;
+- optional reference WAV as `bytes`;
+- optional reference transcript;
+- reference-mode fields already supported by the runtime;
+- model-specific generation settings;
+- requested output format.
 
-The app stores a generation number with each part. A newer translation or TTS
-configuration invalidates older work even if it completes later.
+Reference audio is binary protobuf data. It is not base64 text.
 
-The frontend receives the same turn ID, part ID, and generation number with a
-prepared-audio notification. It must remove a buffered artifact when a later
-turn update invalidates that identity.
+The first streaming version accepts one complete request message. Client-side
+request streaming is not needed because reference WAVs are bounded and must be
+available before reference encoding starts.
 
-## Preparation Policy
+### Events
 
-The first implementation prepares closed bubbles whose target translation is
-final. It does not prepare a changing preview.
+`SynthesisEvent` has one of three payloads:
 
-The app controls preparation with configurable limits:
+1. `Started`
+2. `AudioChunk`
+3. `Completed`
 
-- maximum active preparations per principal;
-- maximum queued preparations per principal;
-- maximum active preparations for one app process;
-- maximum prepared bytes and artifacts per voice session;
-- artifact lifetime after a turn or session closes.
+`Started` contains:
 
-These are app resource controls. They are not fields that a browser may choose.
-
-When the user presses `Speak`, the app follows this order:
-
-1. use the exact prepared generation if the browser already has it;
-2. join the exact in-flight preparation instead of submitting a duplicate;
-3. start an on-demand stream on a cache miss.
-
-Preparation failures stay silent in the UI. An explicit `Speak` action may
-retry on demand. Overload must not start a preparation retry loop.
-
-## Principal Fairness
-
-The app derives one stable opaque `fairness_key` from its resolved principal
-and stores it with the voice session. Every TTS request for that principal uses
-the same key. Opening more browser or voice sessions must not create more
-scheduler shares.
-
-The browser cannot supply or override the key.
-
-TTS-pool continues to apply its existing weighted least-served scheduler. One
-principal may borrow unused runtime capacity. A contending principal receives
-fair progress when a slot becomes free. The streaming result path does not
-change scheduler selection or service accounting.
-
-Fairness is local to the configured TTS-pool. Product credits, quotas, and app
-request limits remain app concerns.
-
-## App-to-Pool Streaming Contract
-
-The production transport will expose one logical synthesis stream per request.
-The app client presents one stable interface regardless of the selected wire
-mechanism:
-
-```python
-async for event in tts_client.synthesize_stream(request):
-    ...
-```
-
-One app process initially owns one long-lived connection or channel to its
-configured TTS-pool. Concurrent synthesis requests use independent logical
-streams on that connection. The synthesis API does not expose connection
-selection to callers.
-
-The request contains the existing synthesis data plus the trusted
-`fairness_key`. Reference audio should use binary bytes in the streaming
-transport rather than base64 text.
-
-### Stream events
-
-The logical response contains ordered events:
-
-1. `started`;
-2. zero or more `audio` events;
-3. exactly one `completed` or `error` terminal event.
-
-`started` contains:
-
-- output encoding;
+- response ID;
+- model name;
 - sample rate;
 - channel count;
-- request and model identity required for correlation.
+- sample encoding;
+- scheduler queue wait;
+- normalized generation identity needed for logging.
 
-Each `audio` event contains:
+`AudioChunk` contains:
 
-- a monotonically increasing sequence number;
-- binary PCM payload;
-- enough sample-position information to detect a gap or duplicate.
+- monotonically increasing sequence number;
+- first sample position;
+- signed 16-bit little-endian PCM bytes.
 
-The initial output format is mono signed 16-bit little-endian PCM at the model
-sample rate. TTS-pool does not need a final WAV header before emitting PCM.
+The initial stream format is mono PCM at the runtime sample rate. Each event is
+self-delimiting through protobuf and gRPC framing. TTS-pool does not need a WAV
+header before it sends the first chunk.
 
-`completed` contains:
+`Completed` contains:
 
-- final sample count and duration;
-- pool, queue, backend, and first-chunk timings;
-- model metadata already returned by the non-streaming response.
+- total sample count;
+- duration;
+- chunk count;
+- queue, reference, generation, and transport timings;
+- the bounded model metadata returned by the complete API.
 
-An error before `started` is a normal request error. An error after audio has
-started terminates the stream and marks the partial audio unusable for replay.
-The frontend may finish audio it already buffered, but must not treat it as a
-complete artifact.
+Exactly one `Started` event precedes audio. Exactly one `Completed` event ends a
+successful stream. Failures terminate the RPC with a non-OK gRPC status rather
+than an in-band error event.
 
-### `stream=false`
+## Error Mapping
 
-The non-streaming path remains supported. Both response modes use one backend
-generation source:
+| TTS-pool condition | gRPC status |
+| --- | --- |
+| Unknown model | `NOT_FOUND` |
+| Model loading, unloading, or unavailable | `FAILED_PRECONDITION` |
+| Invalid synthesis input | `INVALID_ARGUMENT` |
+| Per-key or executor queue full | `RESOURCE_EXHAUSTED` |
+| Deadline exceeded while queued or active | `DEADLINE_EXCEEDED` |
+| Caller cancelled | `CANCELLED` |
+| Runtime synthesis failure | `INTERNAL` |
+
+The trailing status details contain the existing stable machine-readable error
+code. They do not contain audio.
+
+## Shared Generation Core
+
+Streaming and complete responses must consume one runtime generation source.
+Do not maintain separate synthesis implementations.
 
 ```text
-NanoVLLM chunk iterator
-    -> stream=true: emit chunks as they arrive
-    -> stream=false: collect chunks and return the current WAV envelope
+runtime chunk iterator
+    ├─> gRPC: encode each chunk as PCM and emit it
+    └─> HTTP: collect the same PCM, add a WAV header, return the WAV
 ```
 
-This prevents output differences between the streaming and non-streaming
-paths.
+The shared stream yields typed internal events:
 
-### Backpressure and cancellation
+- runtime started;
+- audio chunk;
+- runtime completed.
 
-Writing an audio event must respect transport backpressure. TTS-pool must not
-build an unbounded per-client chunk queue.
+The complete path becomes a stream consumer. This guarantees that streaming
+and complete output use the same reference handling, generation parameters,
+chunk conversion, and metadata.
 
-When the client closes or cancels a stream:
+Models without a native incremental iterator remain complete-response only.
+Their advertised capabilities must report streaming as unavailable. The gRPC
+method rejects them with `FAILED_PRECONDITION`; it does not emulate streaming
+by waiting for a complete WAV.
 
-- queued work is removed before it enters the runtime;
-- active output forwarding stops;
-- TTS-pool asks the backend generation to stop;
-- the scheduler accounts for runtime time already consumed;
-- no completed result is reported.
+## NanoVLLM Runtime Refactor
 
-The transport benchmark must verify whether cancelling the NanoVLLM async
-generator releases its active sequence promptly. Until that is proven, active
-cancellation cannot be claimed to save GPU work.
+`NanoVLLMVoxCPMTTSRuntime` currently appends arrays returned by
+`server.generate()` and concatenates them after generation. Split this path
+into these steps:
 
-## Minimal TTS-Pool Change
+1. validate and normalize the request;
+2. prepare and encode reference audio;
+3. start `server.generate()`;
+4. convert and emit each returned waveform chunk;
+5. finalize metrics and metadata.
 
-The TTS-pool implementation is limited to the streaming data path:
+Float waveform values are clipped to `[-1.0, 1.0]` and converted once to
+signed 16-bit PCM. The complete path assembles those PCM bytes into its WAV.
 
-- implement the selected transport;
-- make `stream=true` return incremental audio;
-- expose NanoVLLM chunks without first collecting the complete result;
-- carry stream cancellation to queued and active work where supported;
-- preserve the current scheduler, fairness policy, model configuration, and
-  capacity boundary;
-- keep `stream=false` behavior available from the shared generation source;
-- add streaming latency and cancellation tests.
+The runtime keeps its dedicated event-loop thread. A bounded stream bridge
+moves events from that loop to the executor consumer. The bridge must support a
+thread-safe cancellation signal.
 
-TTS-pool generates and transports audio. It does not own preparation policy,
-browser buffering, playback order, app quotas, or product state.
+## Scheduler Integration
 
-## App Responsibilities
+One synthesis request remains one scheduler job. Streaming does not create a
+second admission path or bypass fairness.
 
-The app owns:
+The executor changes from a result-only future to a synthesis handle containing:
 
-- resolving the principal and deriving the trusted fairness key;
-- selecting its configured TTS-pool;
-- limiting speculative work;
-- starting preparation after a bubble becomes final;
-- deduplicating an explicit request against in-flight preparation;
-- invalidating stale generations;
-- assembling streamed PCM into a replayable WAV;
-- retaining prepared artifacts for a bounded lifetime;
-- releasing parts in turn order;
-- forwarding cache-miss audio to the browser;
-- recording end-to-end latency metrics.
+- a bounded event stream;
+- terminal completion state;
+- a cancellation method;
+- scheduler and runtime timestamps.
 
-A voice session stays assigned to one configured TTS-pool. Pool selection is
-outside the synthesis protocol.
+The fair pending queue continues to select jobs by normalized
+`fairness_key`, virtual service, weight, active work, and activation order.
+HTTP and gRPC jobs compete in the same queue.
 
-## Frontend Responsibilities
+Service accounting starts when the executor dispatches the job. It ends only
+when the runtime iterator exits. A slow or cancelled network consumer cannot
+release a model slot while NanoVLLM is still using the sequence.
 
-The frontend owns:
+## Backpressure
 
-- retrieving prepared artifacts before `Speak`;
-- holding a bounded local audio buffer keyed by part identity and generation;
-- discarding buffered audio after invalidation or session cleanup;
-- starting prepared playback directly from the user gesture;
-- receiving and buffering streamed cache-miss PCM;
-- preserving part order;
-- reporting playback completion to the app;
-- handling browser autoplay restrictions without regenerating audio.
+Every synthesis handle has a bounded event buffer. Configure both a chunk limit
+and a byte limit.
 
-Prepared complete artifacts can continue to use an app HTTP artifact URL. They
-are fetched before the click, so this transfer is outside the critical path.
+When the buffer is full:
 
-For cache misses, the existing voice WebSocket carries stream control and
-binary audio frames from the app to the browser. Each binary frame identifies
-the clip and sequence. The browser feeds PCM to an `AudioWorklet` or equivalent
-streaming playback buffer. The app keeps transcript and turn events as JSON.
+1. runtime-to-transport forwarding waits for a short configured interval;
+2. continued saturation marks the consumer as stalled;
+3. the synthesis is cancelled;
+4. the runtime slot remains charged until generation actually stops.
 
-## Failure Semantics
+TTS-pool must never build an unbounded PCM queue. One stalled stream must not
+consume memory or block transport progress for unrelated streams.
 
-| Condition | Required behavior |
-| --- | --- |
-| Prepared artifact is ready | Play the exact buffered generation |
-| Preparation is still running | Join it; do not submit duplicate work |
-| Preparation failed | Generate on demand after `Speak` |
-| Translation or settings changed | Invalidate older app and browser entries |
-| User changes turn or lane | Stop playback and discard stale entries |
-| Browser disconnects | Stop forwarding and release session buffers |
-| Pool rejects preparation | Keep the UI usable; do not retry in a loop |
-| Pool rejects explicit speech | Show a concise playback error |
-| Stream fails after partial audio | Do not cache the partial clip for replay |
-| Playback is blocked by the browser | Keep prepared audio and show the resume control |
+Do not apply gRPC compression to PCM chunks. PCM is not usefully compressed by
+generic message compression, and compression adds latency and CPU work.
 
-## Transport Selection Benchmark
+## Cancellation
 
-Benchmark two small streaming prototypes before fixing the production wire
-contract:
+Cancellation has two paths.
 
-1. binary streaming HTTP using the service's Python async stack;
-2. `grpc.aio` with one request and a server-streamed event response.
+### Queued job
 
-Both prototypes must consume the same synthetic or NanoVLLM chunk iterator and
-send the same event information. The benchmark compares transport behavior,
-not model output.
+Remove the job from its fairness bucket, complete its handle as cancelled, and
+never dispatch it to the runtime.
 
-Run tests on loopback and on the real app-to-pool network route. Cover:
+### Active job
 
-- cold and warm connections;
-- with and without reference audio;
-- active NanoVLLM concurrency 1, 2, and 4;
-- synthetic concurrent streams at 10, 100, 500, and 1,000;
-- one slow consumer beside normal consumers;
-- cancellation while queued and while active;
-- a disconnected client;
-- simultaneous preparation and on-demand streams.
+Set the handle's cancellation signal, stop forwarding output, and close the
+NanoVLLM async generator. The scheduler charges the active service time up to
+the point at which the generator exits.
 
-Measure:
+An implementation test must prove that closing the generator releases the
+active NanoVLLM sequence promptly. Until that test passes, TTS-pool may stop
+delivery but must not claim that active cancellation saves GPU work.
 
-- request start to backend start;
-- backend first chunk to server transport write;
-- backend first chunk to client receipt;
-- client receipt to first playable browser buffer;
-- p50, p95, and p99 time to first audio;
-- inter-chunk gap and jitter;
-- client-side waiting before a stream is opened;
-- CPU time and memory per active stream;
-- bytes transferred and number of copies;
-- cancellation-to-slot-release time;
-- effect of a slow stream on unrelated streams.
+Model unload and service shutdown use the same mechanism. Pending jobs cancel
+first. Active streams receive a bounded grace period before forced shutdown.
 
-The selected transport must:
+## Complete HTTP API
 
-- expose the first chunk without waiting for completion;
-- add no more than one network round trip plus 10 ms at p95 between backend
-  first chunk and client receipt on the real route;
-- keep unrelated streams progressing when one consumer is slow;
-- propagate cancellation without leaked queue or stream state;
-- support independent concurrent streams over one warm client connection;
-- carry binary reference and output audio without base64;
-- have bounded memory under the synthetic concurrency test.
+`POST /v1/responses` remains the complete-response API. It returns the current
+WAV envelope after consuming the shared generation stream.
 
-When both candidates meet the limits, choose the smaller operational and code
-surface.
+Streaming belongs exclusively to gRPC. The HTTP `stream` request field is not
+part of the target contract and should be removed when the gRPC contract lands.
+TTS-pool should not expose two streaming protocols.
+
+## Configuration
+
+Add a `service.grpc` section:
+
+```json
+{
+  "service": {
+    "grpc": {
+      "enabled": true,
+      "host": "0.0.0.0",
+      "port": 8021,
+      "max_receive_message_bytes": 16777216,
+      "max_send_message_bytes": 16777216,
+      "stream_buffer_chunks": 4,
+      "stream_buffer_bytes": 1048576,
+      "stalled_consumer_timeout_s": 2.0,
+      "shutdown_grace_s": 5.0
+    }
+  }
+}
+```
+
+The message limits must remain at least as strict as the current reference-audio
+limit. Startup rejects invalid ports, non-positive limits, and a buffer too
+small for one maximum-size runtime chunk.
+
+The gRPC port is intended for a trusted private network. TLS can be added at
+the transport boundary when traffic leaves that network; it is not required
+for the initial dc1-to-dc2 deployment.
 
 ## Observability
 
-Use one correlation identity through browser, app, and TTS-pool. Record these
-timestamps or durations:
+Use one response ID from admission through the terminal event. Record:
 
 ```text
-bubble_final
-preparation_submitted
-pool_enqueued
-backend_started
+request_received
+job_enqueued
+job_dispatched
+reference_started
+reference_completed
 backend_first_chunk
-app_first_chunk_received
-browser_first_chunk_received
-speak_clicked
-playback_started
+grpc_first_chunk_written
 generation_completed
-playback_completed
+stream_completed
+stream_cancelled
+runtime_released
 ```
 
 Derived metrics include:
 
-- preparation hit, in-flight join, or cache miss;
-- click-to-playback-start;
-- pool queue wait;
+- scheduler queue wait;
+- reference preparation and encoding time;
 - backend time to first chunk;
-- transport time for the first chunk;
-- browser startup-buffer time;
-- prepared bytes retained per session;
-- stale preparations and completed stale work;
-- audible gaps between parts;
-- pool rejections and stream failures.
+- first-chunk transport handoff time;
+- generation wall time;
+- chunks and PCM bytes emitted;
+- maximum buffered chunks and bytes;
+- stalled-consumer cancellations;
+- queued and active cancellations;
+- cancellation-to-runtime-release time;
+- gRPC status counts;
+- complete-response versus streaming request counts.
 
-Do not use principal or fairness-key values as unbounded metric labels. Logs may
-carry a bounded or hashed correlation value where needed.
+Do not use raw `fairness_key` values as metric labels. Existing bounded or
+hashed log correlation rules continue to apply.
 
-## Delivery Phases
+## Delivery Order
 
-### Phase 1: transport decision
+### Phase 1: contract and server lifecycle
 
-- add the two isolated streaming prototypes;
-- run the benchmark matrix;
-- record the results and select the production transport.
+- add the protobuf schema and generated modules;
+- add gRPC configuration;
+- start and stop `grpc.aio` inside the FastAPI lifespan;
+- add health and clean-shutdown tests.
 
-No app behavior changes in this phase.
+### Phase 2: shared generation core
 
-### Phase 2: TTS-pool streaming
+- define internal stream events and the synthesis handle;
+- let the scheduler dispatch streaming handles;
+- make the complete HTTP path consume the same events;
+- preserve fairness and complete WAV output.
 
-- implement the selected streaming contract;
-- connect it to the NanoVLLM chunk iterator;
-- implement `stream=true` and keep `stream=false` on the shared source;
-- preserve scheduler and fairness behavior;
-- verify output equivalence and cancellation cleanup.
+### Phase 3: NanoVLLM chunks
 
-### Phase 3: app preparation
+- expose each `server.generate()` result immediately;
+- convert each result to PCM once;
+- emit terminal metrics after the iterator completes;
+- verify streamed PCM and complete WAV equivalence.
 
-- attach the resolved principal fairness key to voice sessions;
-- prepare final closed bubbles with bounded concurrency;
-- deduplicate and invalidate by exact generation identity;
-- assemble and retain complete WAV artifacts;
-- expose preparation state to the frontend.
+### Phase 4: backpressure and cancellation
 
-At this point, prepared clicks can be fast even before live browser streaming is
-enabled.
+- enforce bounded stream buffers;
+- remove cancelled queued jobs;
+- propagate active cancellation to NanoVLLM;
+- measure sequence-release latency;
+- cover stalled and disconnected consumers.
 
-### Phase 4: frontend prefetch
+### Phase 5: live validation
 
-- fetch prepared artifacts before the user action;
-- retain bounded local buffers;
-- play the exact local artifact on `Speak`;
-- preserve the existing playback-complete lifecycle.
-
-### Phase 5: cache-miss streaming
-
-- forward TTS-pool PCM events over the voice WebSocket;
-- add streaming browser playback;
-- assemble the same PCM into a replayable app artifact;
-- measure click-to-audio and inter-part gaps end to end.
-
-### Phase 6: tuning
-
-- tune preparation limits from measured contention and stale-work rates;
-- tune browser startup buffering from measured jitter;
-- test larger deployed model capacities without changing the protocol.
+- measure loopback and dc1-to-dc2 first-chunk latency;
+- test active sequence counts 1, 2, and 4;
+- repeat fair-progress and weighted-service checks;
+- run a long-lived channel soak test;
+- verify service restart and model unload behavior.
 
 ## Acceptance Criteria
 
-The complete feature is ready when:
+The refactor is complete when:
 
-- a prepared bubble starts from the browser buffer without a network wait;
-- a cache miss begins playback from incremental PCM before full generation
-  completes;
-- several selected bubbles play in their original order;
-- stale audio never plays after text, settings, lane, turn, or account changes;
-- retries and explicit speech do not duplicate an in-flight preparation;
-- one principal cannot gain scheduler share by opening more sessions;
-- a slow or disconnected browser does not create unbounded buffering;
-- the existing non-streaming API still produces equivalent complete audio;
-- latency metrics separate model, pool queue, transport, app, and browser time.
+- the first NanoVLLM chunk is emitted before full generation completes;
+- gRPC and HTTP output decode to the same PCM samples;
+- one channel carries concurrent synthesis RPCs;
+- every request passes through the existing fair scheduler;
+- queued cancellation prevents runtime dispatch;
+- active cancellation has measured sequence-release behavior;
+- a stalled consumer cannot create unbounded buffering;
+- a slow stream does not stop unrelated streams;
+- complete HTTP behavior and admin endpoints remain green;
+- model unload and process shutdown terminate every stream cleanly;
+- live first-chunk metrics separate queue, reference, backend, and transport
+  time.
