@@ -151,8 +151,8 @@ Good fit:
 - It can be modelled as a separate backend, for example `nanovllm_voxcpm`.
 - It has its own internal scheduler and batching limits.
 - It supports concurrent requests via `max_num_seqs`.
-- It streams waveform chunks internally, while `tts-pool` can initially collect
-  chunks and return the existing base64 WAV response.
+- It streams waveform chunks internally; `tts-pool` forwards them as PCM over
+  the gRPC synthesis stream.
 - It supports VoxCPM2 reference audio through encoded `ref_audio_latents`.
 - It has model metadata including output sample rate.
 
@@ -236,14 +236,13 @@ Implemented on 2026-05-11:
    - `nanovllm_gpu_memory_utilization`
    - `nanovllm_max_generate_length`
 4. The runtime capability is derived from `nanovllm_max_num_seqs`.
-5. The backend collects NanoVLLM chunks into the existing `/v1/responses` WAV
-   response.
+5. The backend emits NanoVLLM PCM chunks through the versioned gRPC synthesis
+   stream.
 6. The ASR Translate TTS app can select the `nanovllm_voxcpm` model through its
    TTS options.
 
 Still out of scope:
 
-- true streaming responses
 - reference-latent caching across repeated calls
 - automatic per-host tuning for 16GB versus larger GPUs
 

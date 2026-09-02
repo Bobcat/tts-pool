@@ -36,7 +36,7 @@ the fairness policy and its deterministic tests, not copy the llm-pool
 scheduler module or its replica layer.
 
 TTS-specific choices remain local to this service. In particular, pending queue
-sizes must account for base64 reference audio, and Nano-vLLM capacity must stay
+sizes must account for binary reference audio, and Nano-vLLM capacity must stay
 bounded by `max_num_seqs`.
 
 ## Current Behavior
@@ -128,10 +128,10 @@ Weights must be finite and greater than zero. Requests must not contain a
 weight or priority field. A key missing from `weights` uses `default_weight`.
 
 The initial queue depths are deliberately below llm-pool's values. A pending
-TTS request can hold base64 reference audio and is materially larger than a
-normal text-only LLM request. The API also limits `reference_audio.data_base64`
-to 16,777,216 characters so a count limit also bounds retained reference-audio
-text. Revisit both limits after measuring representative request memory.
+TTS request can hold binary reference audio and is materially larger than a
+normal text-only LLM request. The gRPC contract limits reference audio to
+12,582,912 raw bytes so a count limit also bounds retained reference-audio
+data. Revisit both limits after measuring representative request memory.
 
 The same fairness settings may be read by every model executor. Each executor
 keeps independent state. Per-model weight overrides are not needed in the first
@@ -260,17 +260,15 @@ Bound pending work in two places:
 Active jobs do not count as pending. Check the per-key limit first, followed by
 the executor total.
 
-Reject `reference_audio.data_base64` values longer than 16,777,216 characters
-during request validation. Queue depths alone cannot bound retained memory when
-one request may contain an arbitrarily large string.
+Reject binary reference audio larger than 12,582,912 bytes during request
+validation. Queue depths alone cannot bound retained memory when one request
+may contain arbitrarily large audio.
 
-The synchronous FastAPI response route holds one shared worker-thread token per
-active or pending request. Keep the aggregate configured queue capacity across
-loaded executors below that worker capacity with headroom for admin requests.
-If the number of loaded executors or queue depths grows, replace the blocking
-API-to-scheduler bridge before raising these limits.
+The async gRPC server consumes scheduler events without parking one worker
+thread per queued RPC. The scheduler still bounds pending work per key and per
+executor before any model work starts.
 
-Reject before enqueue with HTTP `429`:
+Reject before enqueue with gRPC `RESOURCE_EXHAUSTED`:
 
 | Condition | Error code |
 | --- | --- |
@@ -373,7 +371,7 @@ later, one public model should keep one shared fairness queue across them.
 Add deterministic tests for:
 
 - fairness-key trimming, length, blank rejection, and anonymous default;
-- reference-audio base64 length rejection;
+- reference-audio byte-length rejection;
 - FIFO order within one key;
 - round-robin tie-breaking between equal keys;
 - weighted long-run slot-time with unequal synthesis durations and effective
@@ -449,7 +447,7 @@ Start with:
 3. `idle_state_ttl_s = 300`;
 4. `target_inflight = 2` and Nano-vLLM `max_num_seqs = 2` in the first live
    deployment;
-5. at most 16,777,216 base64 characters per reference-audio value.
+5. at most 12,582,912 raw bytes per reference-audio value.
 
 These are runtime controls, not product entitlements. Revisit the queue depths
 and concurrency pair after the load measurement described above.
