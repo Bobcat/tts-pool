@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import base64
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import io
 import json
 from pathlib import Path
 import statistics
@@ -15,6 +15,13 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request
 from urllib.request import urlopen
+import wave
+
+import grpc
+from google.protobuf.json_format import MessageToDict
+
+from app.grpc_api.v1 import tts_pb2
+from app.grpc_api.v1 import tts_pb2_grpc
 
 
 DEFAULT_REFERENCE_TEXT = (
@@ -25,11 +32,84 @@ DEFAULT_TARGET_TEXT = (
 )
 
 
+@dataclass(frozen=True)
+class _GrpcSynthesisResult:
+    pcm: bytes
+    sample_rate_hz: int
+    channel_count: int
+    duration_ms: int
+    metrics: dict[str, Any]
+
+    def wav_bytes(self) -> bytes:
+        output = io.BytesIO()
+        with wave.open(output, "wb") as writer:
+            writer.setnchannels(self.channel_count)
+            writer.setsampwidth(2)
+            writer.setframerate(self.sample_rate_hz)
+            writer.writeframes(self.pcm)
+        return output.getvalue()
+
+
+class _GrpcClient:
+    def __init__(self, channel: grpc.Channel) -> None:
+        self._stub = tts_pb2_grpc.TTSServiceStub(channel)
+
+    def synthesize(
+        self,
+        request: tts_pb2.SynthesisRequest,
+        *,
+        timeout_s: float,
+    ) -> _GrpcSynthesisResult:
+        started: tts_pb2.Started | None = None
+        completed: tts_pb2.Completed | None = None
+        chunks: list[bytes] = []
+        next_sequence = 0
+        next_sample = 0
+        for event in self._stub.Synthesize(request, timeout=timeout_s):
+            kind = event.WhichOneof("payload")
+            if completed is not None:
+                raise RuntimeError("gRPC event received after Completed")
+            if kind == "started":
+                if started is not None or chunks:
+                    raise RuntimeError("gRPC Started event is out of order")
+                if event.started.encoding != tts_pb2.AUDIO_ENCODING_PCM_S16LE:
+                    raise RuntimeError("gRPC stream did not return PCM S16LE")
+                started = event.started
+            elif kind == "audio_chunk":
+                if started is None:
+                    raise RuntimeError("gRPC audio arrived before Started")
+                chunk = event.audio_chunk
+                if chunk.sequence_number != next_sequence or chunk.first_sample != next_sample:
+                    raise RuntimeError("gRPC audio chunk is out of order")
+                frame_bytes = int(started.channel_count) * 2
+                if frame_bytes <= 0 or len(chunk.pcm) % frame_bytes:
+                    raise RuntimeError("gRPC audio chunk is not frame-aligned")
+                chunks.append(bytes(chunk.pcm))
+                next_sequence += 1
+                next_sample += len(chunk.pcm) // frame_bytes
+            elif kind == "completed":
+                completed = event.completed
+            else:
+                raise RuntimeError("gRPC stream returned an empty event")
+        if started is None or completed is None:
+            raise RuntimeError("gRPC stream ended without terminal metadata")
+        if completed.chunk_count != next_sequence or completed.total_sample_count != next_sample:
+            raise RuntimeError("gRPC terminal counts do not match received audio")
+        return _GrpcSynthesisResult(
+            pcm=b"".join(chunks),
+            sample_rate_hz=int(started.sample_rate_hz),
+            channel_count=int(started.channel_count),
+            duration_ms=int(completed.duration_ms),
+            metrics=MessageToDict(completed.metrics, preserving_proto_field_name=True),
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark tts-pool NanoVLLM concurrency and scheduler fairness through HTTP.",
+        description="Benchmark tts-pool NanoVLLM concurrency and scheduler fairness through gRPC.",
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8020")
+    parser.add_argument("--grpc-target", default="127.0.0.1:8021")
     parser.add_argument("--model", default="nanovllm_voxcpm")
     parser.add_argument("--reference-model", default="kokoro")
     parser.add_argument("--reference-preset", default="af_heart")
@@ -70,48 +150,52 @@ def run_benchmark(args: argparse.Namespace, *, concurrencies: list[int]) -> dict
     gpu_sampler.start()
     started_at = time.time()
     try:
-        reference = _create_reference(
-            base_url=base_url,
-            model=args.reference_model,
-            preset=args.reference_preset,
-            timeout_s=args.timeout_s,
-        )
-        _warm_request_shapes(base_url=base_url, args=args, reference=reference)
+        with grpc.insecure_channel(str(args.grpc_target)) as channel:
+            tts_client = _GrpcClient(channel)
+            reference = _create_reference(
+                tts_client=tts_client,
+                model=args.reference_model,
+                preset=args.reference_preset,
+                timeout_s=args.timeout_s,
+            )
+            _warm_request_shapes(tts_client=tts_client, args=args, reference=reference)
 
-        batches: list[dict[str, Any]] = []
-        for case_name, case_reference in (
-            ("no_reference", None),
-            ("paired_reference", reference),
-        ):
-            for concurrency in concurrencies:
-                for repeat in range(1, args.repeats + 1):
-                    batches.append(
-                        _run_batch(
-                            base_url=base_url,
-                            args=args,
-                            case_name=case_name,
-                            reference=case_reference,
-                            concurrency=concurrency,
-                            repeat=repeat,
+            batches: list[dict[str, Any]] = []
+            for case_name, case_reference in (
+                ("no_reference", None),
+                ("paired_reference", reference),
+            ):
+                for concurrency in concurrencies:
+                    for repeat in range(1, args.repeats + 1):
+                        batches.append(
+                            _run_batch(
+                                tts_client=tts_client,
+                                args=args,
+                                case_name=case_name,
+                                reference=case_reference,
+                                concurrency=concurrency,
+                                repeat=repeat,
+                            )
                         )
-                    )
 
-        fairness = None
-        if args.fairness_capacity > 0:
-            fairness = _run_fair_progress_check(
-                base_url=base_url,
-                args=args,
-                reference=reference,
-                capacity=args.fairness_capacity,
-            )
+            fairness = None
+            if args.fairness_capacity > 0:
+                fairness = _run_fair_progress_check(
+                    base_url=base_url,
+                    tts_client=tts_client,
+                    args=args,
+                    reference=reference,
+                    capacity=args.fairness_capacity,
+                )
 
-        weighted = None
-        if args.weighted_check:
-            weighted = _run_weighted_check(
-                base_url=base_url,
-                args=args,
-                reference=reference,
-            )
+            weighted = None
+            if args.weighted_check:
+                weighted = _run_weighted_check(
+                    base_url=base_url,
+                    tts_client=tts_client,
+                    args=args,
+                    reference=reference,
+                )
     finally:
         gpu_sampler.stop()
 
@@ -121,6 +205,7 @@ def run_benchmark(args: argparse.Namespace, *, concurrencies: list[int]) -> dict
         "started_at_unix_s": started_at,
         "finished_at_unix_s": time.time(),
         "base_url": base_url,
+        "grpc_target": str(args.grpc_target),
         "model": args.model,
         "concurrencies": concurrencies,
         "repeats": args.repeats,
@@ -142,43 +227,44 @@ def run_benchmark(args: argparse.Namespace, *, concurrencies: list[int]) -> dict
 
 def _create_reference(
     *,
-    base_url: str,
+    tts_client: _GrpcClient,
     model: str,
     preset: str,
     timeout_s: float,
 ) -> dict[str, Any]:
-    response = _post_json(
-        f"{base_url}/v1/responses",
-        {
-            "model": model,
-            "input": DEFAULT_REFERENCE_TEXT,
-            "language": "English",
-            "voice": {"preset": preset},
-            "generation": {"kokoro": {"speed": 1.0}},
-            "stream": False,
-        },
+    response = tts_client.synthesize(
+        tts_pb2.SynthesisRequest(
+            model=model,
+            input=DEFAULT_REFERENCE_TEXT,
+            language="English",
+            fairness_key="bench-reference",
+            voice=tts_pb2.VoiceSpec(preset=preset),
+            generation=tts_pb2.GenerationParams(
+                kokoro=tts_pb2.KokoroGenerationParams(speed=1.0),
+            ),
+            output_encoding=tts_pb2.AUDIO_ENCODING_PCM_S16LE,
+        ),
         timeout_s=timeout_s,
     )
-    audio = response["audio"]
-    wav_base64 = str(audio["data_base64"])
+    wav_bytes = response.wav_bytes()
     return {
-        "mime_type": str(audio["mime_type"]),
-        "data_base64": wav_base64,
-        "duration_ms": int(audio.get("duration_ms") or 0),
-        "wav_bytes": len(base64.b64decode(wav_base64)),
+        "mime_type": "audio/wav",
+        "data": wav_bytes,
+        "duration_ms": response.duration_ms,
+        "wav_bytes": len(wav_bytes),
         "prompt_text": DEFAULT_REFERENCE_TEXT,
     }
 
 
 def _warm_request_shapes(
     *,
-    base_url: str,
+    tts_client: _GrpcClient,
     args: argparse.Namespace,
     reference: dict[str, Any],
 ) -> None:
     for case_reference in (None, reference):
         _synthesize(
-            base_url=base_url,
+            tts_client=tts_client,
             args=args,
             label="warmup",
             fairness_key="bench-warmup",
@@ -189,7 +275,7 @@ def _warm_request_shapes(
 
 def _run_batch(
     *,
-    base_url: str,
+    tts_client: _GrpcClient,
     args: argparse.Namespace,
     case_name: str,
     reference: dict[str, Any] | None,
@@ -201,7 +287,7 @@ def _run_batch(
         futures = [
             pool.submit(
                 _synthesize,
-                base_url=base_url,
+                tts_client=tts_client,
                 args=args,
                 label=f"{case_name}-c{concurrency}-r{repeat}-j{index}",
                 fairness_key="bench-throughput",
@@ -252,6 +338,7 @@ def _run_batch(
 def _run_fair_progress_check(
     *,
     base_url: str,
+    tts_client: _GrpcClient,
     args: argparse.Namespace,
     reference: dict[str, Any],
     capacity: int,
@@ -265,7 +352,7 @@ def _run_fair_progress_check(
         a_futures: list[Future[dict[str, Any]]] = [
             pool.submit(
                 _synthesize,
-                base_url=base_url,
+                tts_client=tts_client,
                 args=args,
                 label=f"fair-a-{index}",
                 fairness_key=key_a,
@@ -284,7 +371,7 @@ def _run_fair_progress_check(
         )
         b_future = pool.submit(
             _synthesize,
-            base_url=base_url,
+            tts_client=tts_client,
             args=args,
             label="fair-b",
             fairness_key=key_b,
@@ -335,6 +422,7 @@ def _run_fair_progress_check(
 def _run_weighted_check(
     *,
     base_url: str,
+    tts_client: _GrpcClient,
     args: argparse.Namespace,
     reference: dict[str, Any],
 ) -> dict[str, Any]:
@@ -350,7 +438,7 @@ def _run_weighted_check(
         futures = [
             pool.submit(
                 _synthesize,
-                base_url=base_url,
+                tts_client=tts_client,
                 args=args,
                 label=f"weight-{key}-{index}",
                 fairness_key=key,
@@ -399,7 +487,7 @@ def _run_weighted_check(
 
 def _synthesize(
     *,
-    base_url: str,
+    tts_client: _GrpcClient,
     args: argparse.Namespace,
     label: str,
     fairness_key: str,
@@ -407,44 +495,47 @@ def _synthesize(
     target_text: str,
     max_generate_length: int | None = None,
 ) -> dict[str, Any]:
-    voice: dict[str, Any] = {"instructions": "Speak in English with a clear, natural voice."}
+    voice = tts_pb2.VoiceSpec(
+        instructions="Speak in English with a clear, natural voice.",
+    )
     if reference is not None:
-        voice["reference_audio"] = {
-            "mime_type": reference["mime_type"],
-            "data_base64": reference["data_base64"],
-            "max_duration_s": 8.0,
-            "prompt_text": reference["prompt_text"],
-            "also_use_as_reference": True,
-        }
+        voice.reference_audio.CopyFrom(
+            tts_pb2.ReferenceAudio(
+                mime_type=reference["mime_type"],
+                data=reference["data"],
+                max_duration_s=8.0,
+                prompt_text=reference["prompt_text"],
+                also_use_as_reference=True,
+            )
+        )
     submitted_at = time.perf_counter()
-    response = _post_json(
-        f"{base_url}/v1/responses",
-        {
-            "model": args.model,
-            "input": target_text,
-            "language": "English",
-            "fairness_key": fairness_key,
-            "voice": voice,
-            "generation": {
-                "nanovllm_voxcpm": {
-                    "temperature": args.temperature,
-                    "max_generate_length": max_generate_length or args.max_generate_length,
-                }
-            },
-            "stream": False,
-        },
+    response = tts_client.synthesize(
+        tts_pb2.SynthesisRequest(
+            model=args.model,
+            input=target_text,
+            language="English",
+            fairness_key=fairness_key,
+            voice=voice,
+            generation=tts_pb2.GenerationParams(
+                nanovllm_voxcpm=tts_pb2.NanoVLLMVoxCPMGenerationParams(
+                    temperature=args.temperature,
+                    max_generate_length=max_generate_length or args.max_generate_length,
+                ),
+            ),
+            output_encoding=tts_pb2.AUDIO_ENCODING_PCM_S16LE,
+        ),
         timeout_s=args.timeout_s,
     )
     finished_at = time.perf_counter()
-    metrics = dict(response.get("metrics") or {})
+    metrics = response.metrics
     queue_wait_s = float(metrics.get("engine_queue_wait_ms") or 0.0) / 1000.0
     return {
         "label": label,
         "fairness_key": fairness_key,
         "client_wall_ms": round((finished_at - submitted_at) * 1000.0, 1),
         "estimated_backend_started_at": submitted_at + queue_wait_s,
-        "audio_bytes": len(base64.b64decode(response["audio"]["data_base64"])),
-        "duration_ms": response["audio"].get("duration_ms"),
+        "audio_bytes": len(response.pcm),
+        "duration_ms": response.duration_ms,
         "metrics": metrics,
     }
 

@@ -128,8 +128,9 @@ no warning-or-higher journal entries and `NRestarts=0`.
 
 ## Reproduce the Test
 
-The benchmark uses only the Python standard library. Run it while tts-pool is
-loaded and idle enough for meaningful timing results.
+The benchmark sends synthesis over the gRPC data plane and reads scheduler
+state from the HTTP control plane. Run it while tts-pool is loaded and idle
+enough for meaningful timing results.
 
 Test the current 2/2 configuration:
 
@@ -163,9 +164,9 @@ test. The script does not edit configuration or control the service.
 
 The JSON output contains configuration snapshots, per-request metrics, batch
 summaries, GPU-memory samples, and the evidence used by both scheduler checks.
-It exits nonzero on HTTP errors, response-format errors, or a failed scheduler
-check. A failed scheduler check is also recorded as `passed: false` in the
-corresponding JSON section.
+It exits nonzero on gRPC or HTTP control-plane errors, response-format errors,
+or a failed scheduler check. A failed scheduler check is also recorded as
+`passed: false` in the corresponding JSON section.
 
 ## Limits
 
