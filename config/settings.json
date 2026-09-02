@@ -2,7 +2,18 @@
   "service": {
     "host": "127.0.0.1",
     "port": 8020,
-    "log_level": "info"
+    "log_level": "info",
+    "grpc": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8021,
+      "max_receive_message_bytes": 16777216,
+      "max_send_message_bytes": 16777216,
+      "stream_buffer_chunks": 4,
+      "stream_buffer_bytes": 1048576,
+      "stalled_consumer_timeout_s": 2.0,
+      "shutdown_grace_s": 5.0
+    }
   },
   "engine": {
     "backend": "nanovllm_voxcpm",

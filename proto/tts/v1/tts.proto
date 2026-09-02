@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package tts.v1;
+
+import "google/protobuf/struct.proto";
+
+service TTSService {
+  rpc Synthesize(SynthesisRequest) returns (stream SynthesisEvent);
+}
+
+enum AudioEncoding {
+  AUDIO_ENCODING_UNSPECIFIED = 0;
+  AUDIO_ENCODING_PCM_S16LE = 1;
+}
+
+message ReferenceAudio {
+  string mime_type = 1;
+  bytes data = 2;
+  optional double max_duration_s = 3;
+  string prompt_text = 4;
+  optional bool also_use_as_reference = 5;
+}
+
+message VoiceSpec {
+  string preset = 1;
+  string instructions = 2;
+  optional ReferenceAudio reference_audio = 3;
+}
+
+message KokoroGenerationParams {
+  optional double speed = 1;
+}
+
+message VoxCPM2GenerationParams {
+  optional double cfg_value = 1;
+  optional int32 inference_timesteps = 2;
+  optional bool normalize = 3;
+  optional bool denoise = 4;
+}
+
+message NanoVLLMVoxCPMGenerationParams {
+  optional double cfg_value = 1;
+  optional double temperature = 2;
+  optional int32 max_generate_length = 3;
+}
+
+message GenerationParams {
+  KokoroGenerationParams kokoro = 1;
+  VoxCPM2GenerationParams voxcpm2 = 2;
+  NanoVLLMVoxCPMGenerationParams nanovllm_voxcpm = 3;
+}
+
+message SynthesisRequest {
+  string model = 1;
+  string input = 2;
+  string language = 3;
+  string fairness_key = 4;
+  VoiceSpec voice = 5;
+  GenerationParams generation = 6;
+  AudioEncoding output_encoding = 7;
+}
+
+message Started {
+  string response_id = 1;
+  string model = 2;
+  uint32 sample_rate_hz = 3;
+  uint32 channel_count = 4;
+  AudioEncoding encoding = 5;
+  double scheduler_queue_wait_ms = 6;
+}
+
+message AudioChunk {
+  uint64 sequence_number = 1;
+  uint64 first_sample = 2;
+  bytes pcm = 3;
+}
+
+message Completed {
+  uint64 total_sample_count = 1;
+  uint64 duration_ms = 2;
+  uint64 chunk_count = 3;
+  google.protobuf.Struct metrics = 4;
+  google.protobuf.Struct metadata = 5;
+}
+
+message SynthesisEvent {
+  oneof payload {
+    Started started = 1;
+    AudioChunk audio_chunk = 2;
+    Completed completed = 3;
+  }
+}

@@ -10,12 +10,12 @@ from pydantic import Field
 from pydantic import field_validator
 
 
-MAX_REFERENCE_AUDIO_BASE64_CHARS = 16_777_216
+MAX_REFERENCE_AUDIO_BYTES = 12_582_912
 
 
 class ReferenceAudio(BaseModel):
     mime_type: str = "audio/wav"
-    data_base64: str = Field(max_length=MAX_REFERENCE_AUDIO_BASE64_CHARS)
+    data: bytes = Field(max_length=MAX_REFERENCE_AUDIO_BYTES)
     max_duration_s: float | None = Field(default=None, gt=0.0, le=60.0)
     # Transcript of the reference audio. When provided, VoxCPM-family
     # engines switch from reference-only to "ultimate cloning": the WAV
@@ -32,15 +32,14 @@ class ReferenceAudio(BaseModel):
     # users tuning by ear.
     also_use_as_reference: bool = True
 
+    def decoded_bytes(self) -> bytes:
+        return self.data
+
 
 class VoiceSpec(BaseModel):
     preset: str | None = None
     instructions: str | None = None
     reference_audio: ReferenceAudio | None = None
-
-
-class AudioFormat(BaseModel):
-    type: Literal["wav"] = "wav"
 
 
 class KokoroGenerationParams(BaseModel):
@@ -72,9 +71,26 @@ class ResponseRequest(BaseModel):
     language: str
     fairness_key: str | None = Field(default=None, max_length=128)
     voice: VoiceSpec = Field(default_factory=VoiceSpec)
-    format: AudioFormat = Field(default_factory=AudioFormat)
     generation: GenerationParams = Field(default_factory=GenerationParams)
-    stream: bool = False
+
+    @field_validator("model", "language", mode="before")
+    @classmethod
+    def _normalize_required_label(cls, value: object) -> object:
+        if not isinstance(value, str):
+            raise ValueError("value must be a string")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
+
+    @field_validator("input", mode="before")
+    @classmethod
+    def _validate_input(cls, value: object) -> object:
+        if not isinstance(value, str):
+            raise ValueError("input must be a string")
+        if not value.strip():
+            raise ValueError("input must not be blank")
+        return value
 
     @field_validator("fairness_key", mode="before")
     @classmethod
@@ -87,22 +103,6 @@ class ResponseRequest(BaseModel):
         if not normalized:
             raise ValueError("fairness_key must not be blank")
         return normalized
-
-
-class AudioOutput(BaseModel):
-    mime_type: str
-    data_base64: str
-    sample_rate_hz: int | None = None
-    duration_ms: int | None = None
-
-
-class ResponseEnvelope(BaseModel):
-    id: str
-    object: Literal["tts_response"] = "tts_response"
-    model: str
-    audio: AudioOutput
-    metrics: dict[str, float | int | None] = Field(default_factory=dict)
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AdminLoadRequest(BaseModel):

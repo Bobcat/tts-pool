@@ -10,6 +10,96 @@ from app.config import load_settings
 
 
 class ConfigTests(unittest.TestCase):
+    def test_grpc_defaults_are_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "settings.json"
+            settings_path.write_text("{}\n", encoding="utf-8")
+
+            grpc = load_settings(settings_path).service.grpc
+
+        self.assertFalse(grpc.enabled)
+        self.assertEqual(grpc.host, "127.0.0.1")
+        self.assertEqual(grpc.port, 8021)
+        self.assertEqual(grpc.stream_buffer_chunks, 4)
+        self.assertEqual(grpc.stream_buffer_bytes, 1_048_576)
+
+    def test_grpc_settings_are_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "service": {
+                            "port": 8020,
+                            "grpc": {
+                                "enabled": True,
+                                "host": "0.0.0.0",
+                                "port": 8021,
+                                "max_receive_message_bytes": 1000,
+                                "max_send_message_bytes": 2000,
+                                "stream_buffer_chunks": 3,
+                                "stream_buffer_bytes": 4000,
+                                "stalled_consumer_timeout_s": 1.5,
+                                "shutdown_grace_s": 2.5,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            grpc = load_settings(settings_path).service.grpc
+
+        self.assertTrue(grpc.enabled)
+        self.assertEqual(grpc.host, "0.0.0.0")
+        self.assertEqual(grpc.port, 8021)
+        self.assertEqual(grpc.max_receive_message_bytes, 1000)
+        self.assertEqual(grpc.max_send_message_bytes, 2000)
+        self.assertEqual(grpc.stream_buffer_chunks, 3)
+        self.assertEqual(grpc.stream_buffer_bytes, 4000)
+        self.assertEqual(grpc.stalled_consumer_timeout_s, 1.5)
+        self.assertEqual(grpc.shutdown_grace_s, 2.5)
+
+    def test_invalid_grpc_settings_are_rejected(self) -> None:
+        invalid_payloads = (
+            {"host": " "},
+            {"port": 0},
+            {"port": 65_536},
+            {"max_receive_message_bytes": 0},
+            {"max_send_message_bytes": -1},
+            {"stream_buffer_chunks": 0},
+            {"stream_buffer_bytes": 0},
+            {"stalled_consumer_timeout_s": 0},
+            {"shutdown_grace_s": "nan"},
+        )
+        for grpc_payload in invalid_payloads:
+            with self.subTest(grpc_payload=grpc_payload):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    settings_path = Path(tmpdir) / "settings.json"
+                    settings_path.write_text(
+                        json.dumps({"service": {"grpc": grpc_payload}}),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ValueError):
+                        load_settings(settings_path)
+
+    def test_enabled_grpc_port_must_differ_from_http_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "service": {
+                            "port": 8020,
+                            "grpc": {"enabled": True, "port": 8020},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "must differ"):
+                load_settings(settings_path)
+
     def test_fairness_defaults_are_loaded(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings_path = Path(tmpdir) / "settings.json"

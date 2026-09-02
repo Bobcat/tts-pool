@@ -3,11 +3,11 @@ from __future__ import annotations
 import threading
 import time
 from typing import Any
+import uuid
 
 from app.config import AppSettings
 from app.config import ModelSettings
 from app.schemas import AdminLoadRequest
-from app.schemas import EngineResult
 from app.schemas import ResponseRequest
 
 from .common import capabilities_for_backend
@@ -21,10 +21,12 @@ from .common import query_primary_gpu_used_mib
 from .common import UnknownModelError
 from .scheduler import ExecutorSnapshot
 from .scheduler import LoadedModelExecutor
+from .streaming import SynthesisHandle
 
 
 class TTSRouterEngine:
     def __init__(self, settings: AppSettings) -> None:
+        self._settings = settings
         self._configured_models = dict(settings.engine.models)
         self._fairness_settings = settings.engine.fairness
         if not self._configured_models:
@@ -69,8 +71,7 @@ class TTSRouterEngine:
             )
         return {"models": models}
 
-    def complete(self, request: ResponseRequest) -> EngineResult:
-        started_at = time.perf_counter()
+    def stream(self, request: ResponseRequest) -> SynthesisHandle:
         model_name = str(request.model or "").strip()
         with self._state_lock:
             if model_name not in self._configured_models:
@@ -82,29 +83,22 @@ class TTSRouterEngine:
             if executor is None:
                 raise ModelStateError(model_name, "model_not_loaded")
             state.inflight_requests += 1
+
+        grpc_settings = self._settings.service.grpc
+        handle = SynthesisHandle(
+            response_id=f"ttsresp_{uuid.uuid4().hex}",
+            model_name=model_name,
+            max_buffer_chunks=grpc_settings.stream_buffer_chunks,
+            max_buffer_bytes=grpc_settings.stream_buffer_bytes,
+            stalled_consumer_timeout_s=grpc_settings.stalled_consumer_timeout_s,
+        )
+        handle.add_terminal_callback(lambda _: self._stream_finished(model_name))
         try:
-            result_future = executor.enqueue(request)
-            result = result_future.result()
-            total_ms = max(0.0, (time.perf_counter() - started_at) * 1000.0)
-            metrics = dict(result.metrics)
-            metrics["engine_total_wall_ms"] = total_ms
-            backend_wall_ms = metrics.get("backend_synthesis_wall_ms")
-            if backend_wall_ms is not None:
-                metrics["engine_outside_backend_wall_ms"] = max(0.0, total_ms - float(backend_wall_ms))
-            return EngineResult(
-                audio=result.audio,
-                mime_type=result.mime_type,
-                sample_rate_hz=result.sample_rate_hz,
-                duration_ms=result.duration_ms,
-                metrics=metrics,
-                metadata=result.metadata,
-            )
-        finally:
-            with self._state_lock:
-                state = self._model_states.get(model_name)
-                if state is not None and state.inflight_requests > 0:
-                    state.inflight_requests -= 1
-                    self._state_changed.notify_all()
+            executor.enqueue_stream(request, handle)
+        except Exception:
+            self._stream_finished(model_name)
+            raise
+        return handle
 
     def admin_models_payload(self, settings: AppSettings | None = None) -> dict[str, object]:
         del settings
@@ -160,10 +154,20 @@ class TTSRouterEngine:
                 resolved_backend=resolved_backend,
             )
             runtime.load()
+            maximum_chunk_bytes = getattr(runtime, "max_stream_chunk_bytes", None)
+            if (
+                maximum_chunk_bytes is not None
+                and int(maximum_chunk_bytes) > self._settings.service.grpc.stream_buffer_bytes
+            ):
+                raise ValueError(
+                    "service.grpc.stream_buffer_bytes is smaller than the runtime's "
+                    "maximum PCM chunk"
+                )
             runtime_capability = int(getattr(runtime, "runtime_capability", 1) or 1)
             executor = LoadedModelExecutor(
                 model_name=model_name,
                 complete_fn=runtime.synthesize,
+                stream_fn=getattr(runtime, "synthesize_stream", None),
                 configured_target_inflight=target_inflight,
                 fairness_settings=self._fairness_settings,
                 runtime_capability=runtime_capability,
@@ -201,6 +205,13 @@ class TTSRouterEngine:
             self._state_changed.notify_all()
             return self._admin_model_entry_locked(model_name, model_settings)
 
+    def _stream_finished(self, model_name: str) -> None:
+        with self._state_lock:
+            state = self._model_states.get(model_name)
+            if state is not None and state.inflight_requests > 0:
+                state.inflight_requests -= 1
+                self._state_changed.notify_all()
+
     def unload_model(self, model_name: str, settings: AppSettings | None = None) -> dict[str, object]:
         del settings
         with self._state_lock:
@@ -210,16 +221,25 @@ class TTSRouterEngine:
             state = self._model_states[model_name]
             if state.lifecycle == "loading":
                 raise ModelStateError(model_name, "model_loading")
-            if state.lifecycle in {"unloaded", "failed", "unloading"}:
+            if state.lifecycle == "unloaded":
+                return self._admin_model_entry_locked(model_name, model_settings)
+            if state.lifecycle == "unloading":
                 return self._admin_model_entry_locked(model_name, model_settings)
             state.lifecycle = "unloading"
             executor = self._executors.get(model_name)
 
         if executor is not None:
             executor.begin_shutdown()
+        deadline = time.monotonic() + self._settings.service.grpc.shutdown_grace_s
         with self._state_lock:
             while state.inflight_requests > 0:
-                self._state_changed.wait()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    state.lifecycle = "failed"
+                    state.last_error = "model unload timed out while synthesis was still active"
+                    self._state_changed.notify_all()
+                    raise RuntimeError(state.last_error)
+                self._state_changed.wait(timeout=remaining)
             executor = self._executors.pop(model_name, None)
             runtime = self._runtimes.pop(model_name, None)
 

@@ -36,10 +36,24 @@ class NanoVLLMWarmupCase:
 
 
 @dataclass(frozen=True)
+class GrpcSettings:
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8021
+    max_receive_message_bytes: int = 16_777_216
+    max_send_message_bytes: int = 16_777_216
+    stream_buffer_chunks: int = 4
+    stream_buffer_bytes: int = 1_048_576
+    stalled_consumer_timeout_s: float = 2.0
+    shutdown_grace_s: float = 5.0
+
+
+@dataclass(frozen=True)
 class ServiceSettings:
     host: str = "127.0.0.1"
     port: int = 8020
     log_level: str = "info"
+    grpc: GrpcSettings = field(default_factory=GrpcSettings)
 
 
 @dataclass(frozen=True)
@@ -116,6 +130,7 @@ def load_settings(path: str | Path | None = None) -> AppSettings:
             payload = _merge_dicts(payload, loaded)
 
     service_payload = _dict(payload.get("service"))
+    grpc_payload = _dict(service_payload.get("grpc"))
     engine_payload = _dict(payload.get("engine"))
     models_payload = _dict(engine_payload.get("models"))
     fairness_value = engine_payload.get("fairness", {})
@@ -181,11 +196,46 @@ def load_settings(path: str | Path | None = None) -> AppSettings:
             nanovllm_warmup_cases=_nanovllm_warmup_cases(model_payload.get("nanovllm_warmup_cases")),
         )
 
+    service_port = _port(service_payload.get("port", 8020), "service.port")
+    grpc_port = _port(grpc_payload.get("port", 8021), "service.grpc.port")
+    grpc_enabled = bool(grpc_payload.get("enabled", False))
+    if grpc_enabled and grpc_port == service_port:
+        raise ValueError("service.grpc.port must differ from service.port")
+
     return AppSettings(
         service=ServiceSettings(
-            host=str(service_payload.get("host", "127.0.0.1")),
-            port=int(service_payload.get("port", 8020)),
-            log_level=str(service_payload.get("log_level", "info")),
+            host=_nonempty_str(service_payload.get("host", "127.0.0.1"), "service.host"),
+            port=service_port,
+            log_level=_nonempty_str(service_payload.get("log_level", "info"), "service.log_level"),
+            grpc=GrpcSettings(
+                enabled=grpc_enabled,
+                host=_nonempty_str(grpc_payload.get("host", "127.0.0.1"), "service.grpc.host"),
+                port=grpc_port,
+                max_receive_message_bytes=_positive_int(
+                    grpc_payload.get("max_receive_message_bytes", 16_777_216),
+                    "service.grpc.max_receive_message_bytes",
+                ),
+                max_send_message_bytes=_positive_int(
+                    grpc_payload.get("max_send_message_bytes", 16_777_216),
+                    "service.grpc.max_send_message_bytes",
+                ),
+                stream_buffer_chunks=_positive_int(
+                    grpc_payload.get("stream_buffer_chunks", 4),
+                    "service.grpc.stream_buffer_chunks",
+                ),
+                stream_buffer_bytes=_positive_int(
+                    grpc_payload.get("stream_buffer_bytes", 1_048_576),
+                    "service.grpc.stream_buffer_bytes",
+                ),
+                stalled_consumer_timeout_s=_positive_float(
+                    grpc_payload.get("stalled_consumer_timeout_s", 2.0),
+                    "service.grpc.stalled_consumer_timeout_s",
+                ),
+                shutdown_grace_s=_positive_float(
+                    grpc_payload.get("shutdown_grace_s", 5.0),
+                    "service.grpc.shutdown_grace_s",
+                ),
+            ),
         ),
         engine=EngineSettings(
             backend=str(engine_payload.get("backend", "stub")).strip().lower() or "stub",
@@ -224,6 +274,20 @@ def _resolve_settings_path(path: str | Path | None) -> Path:
     if env_value:
         return Path(env_value)
     return DEFAULT_SETTINGS_PATH
+
+
+def _nonempty_str(value: object, name: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise ValueError(f"{name} must not be blank")
+    return normalized
+
+
+def _port(value: object, name: str) -> int:
+    parsed = _positive_int(value, name)
+    if parsed > 65_535:
+        raise ValueError(f"{name} must be at most 65535")
+    return parsed
 
 
 def _resolve_local_settings_path(settings_path: Path) -> Path:

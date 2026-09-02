@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import base64
 import importlib
 import importlib.util
 import json
 import os
+import socket
 import sys
 import tempfile
 from pathlib import Path
@@ -51,7 +51,7 @@ class ApiTests(unittest.TestCase):
                     os.environ["TTS_POOL_SETTINGS_PATH"] = previous
         return TestClient(app)
 
-    def test_json_response_mode_returns_audio_response_envelope(self) -> None:
+    def test_http_synthesis_route_is_removed(self) -> None:
         client = self._create_client()
 
         response = client.post(
@@ -60,38 +60,10 @@ class ApiTests(unittest.TestCase):
                 "model": "stub-tts",
                 "input": "Hello world",
                 "language": "English",
-                "stream": False,
             },
         )
 
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["object"], "tts_response")
-        self.assertEqual(payload["model"], "stub-tts")
-        self.assertEqual(payload["audio"]["mime_type"], "audio/wav")
-        self.assertEqual(payload["audio"]["sample_rate_hz"], 16000)
-        self.assertGreater(len(base64.b64decode(payload["audio"]["data_base64"])), 44)
-        self.assertIn("engine_queue_wait_ms", payload["metrics"])
-        self.assertIn("backend_synthesis_wall_ms", payload["metrics"])
-        self.assertIn("engine_total_wall_ms", payload["metrics"])
-        self.assertIn("pool_total_wall_ms", payload["metrics"])
-        self.assertEqual(payload["metadata"]["engine"], "stub")
-
-    def test_streaming_mode_is_explicitly_unsupported(self) -> None:
-        client = self._create_client()
-
-        response = client.post(
-            "/v1/responses",
-            json={
-                "model": "stub-tts",
-                "input": "Hello world",
-                "language": "English",
-                "stream": True,
-            },
-        )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["detail"]["code"], "stream_unsupported")
+        self.assertEqual(response.status_code, 404)
 
     def test_models_endpoint_returns_loaded_models(self) -> None:
         client = self._create_client()
@@ -100,6 +72,49 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"models": ["stub-tts"]})
+
+    def test_fastapi_lifespan_starts_and_stops_grpc_server(self) -> None:
+        import grpc
+        from grpc_health.v1 import health_pb2
+        from grpc_health.v1 import health_pb2_grpc
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            grpc_port = probe.getsockname()[1]
+        client = self._create_client(
+            json.dumps(
+                {
+                    "service": {
+                        "grpc": {
+                            "enabled": True,
+                            "host": "127.0.0.1",
+                            "port": grpc_port,
+                            "shutdown_grace_s": 0.1,
+                        }
+                    },
+                    "engine": {
+                        "backend": "stub",
+                        "models": {
+                            "stub-tts": {
+                                "backend": "stub",
+                                "enabled": True,
+                            }
+                        },
+                    },
+                }
+            )
+        )
+
+        with client:
+            self.assertEqual(client.app.state.grpc_server.bound_port, grpc_port)
+            with grpc.insecure_channel(f"127.0.0.1:{grpc_port}") as channel:
+                response = health_pb2_grpc.HealthStub(channel).Check(
+                    health_pb2.HealthCheckRequest(service="tts.v1.TTSService"),
+                    timeout=1.0,
+                )
+            self.assertEqual(response.status, health_pb2.HealthCheckResponse.SERVING)
+
+        self.assertIsNone(client.app.state.grpc_server.bound_port)
 
     def test_admin_models_endpoint_returns_config_runtime_and_capabilities(self) -> None:
         client = self._create_client()
@@ -175,21 +190,6 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(unload_response.json()["runtime_state"], "unloaded")
         self.assertEqual(client.get("/v1/models").json(), {"models": ["stub-tts"]})
 
-    def test_unloaded_model_response_is_rejected(self) -> None:
-        client = self._create_client()
-
-        response = client.post(
-            "/v1/responses",
-            json={
-                "model": "disabled-tts",
-                "input": "Hello world",
-                "language": "English",
-            },
-        )
-
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.json()["detail"]["code"], "model_not_loaded")
-
     def test_admin_gpu_memory_endpoint_returns_envelope(self) -> None:
         client = self._create_client()
 
@@ -200,59 +200,3 @@ class ApiTests(unittest.TestCase):
         self.assertIn("gpus", payload)
         self.assertIn("models", payload)
         self.assertIn("error", payload)
-
-    def test_admission_errors_are_returned_as_429(self) -> None:
-        import app.main as main
-        from app.engine import RequestAdmissionError
-
-        class RejectingEngine:
-            code = ""
-
-            def complete(self, request):
-                del request
-                raise RequestAdmissionError(
-                    status_code=429,
-                    code=self.code,
-                    message="pending queue is full",
-                )
-
-            def close(self):
-                pass
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings_path = Path(tmpdir) / "settings.json"
-            settings_path.write_text("{}\n", encoding="utf-8")
-            with mock.patch.object(main, "build_engine", return_value=RejectingEngine()):
-                app = main.create_app(settings_path)
-
-        with TestClient(app) as client:
-            for code in ("fairness_key_queue_full", "executor_queue_full"):
-                with self.subTest(code=code):
-                    RejectingEngine.code = code
-                    response = client.post(
-                        "/v1/responses",
-                        json={
-                            "model": "stub-tts",
-                            "input": "Hello",
-                            "language": "English",
-                        },
-                    )
-
-                    self.assertEqual(response.status_code, 429)
-                    self.assertEqual(response.json()["detail"]["code"], code)
-
-    def test_inference_log_contains_normalized_fairness_key(self) -> None:
-        import app.main as main
-        from app.schemas import ResponseRequest
-
-        request = ResponseRequest(
-            model="stub-tts",
-            input="Hello",
-            language="English",
-            fairness_key="  opaque-principal  ",
-        )
-        with mock.patch.object(main.LOGGER, "info") as info:
-            main._log_inference("ttsresp_test", request, {"wall_ms": 1.0})
-
-        payload = json.loads(info.call_args.args[1])
-        self.assertEqual(payload["fairness_key"], "opaque-principal")

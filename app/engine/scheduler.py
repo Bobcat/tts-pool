@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections import deque
-from concurrent.futures import Future
 from dataclasses import dataclass
+import io
 import threading
 import time
 from typing import Callable
+import wave
 
 from app.config import FairnessSettings
 from app.schemas import EngineResult
@@ -13,6 +14,9 @@ from app.schemas import ResponseRequest
 
 from .common import ModelStateError
 from .common import RequestAdmissionError
+from .streaming import RuntimeStreamResult
+from .streaming import SynthesisCancelled
+from .streaming import SynthesisHandle
 
 
 @dataclass(frozen=True)
@@ -41,7 +45,7 @@ class ExecutorSnapshot:
 @dataclass
 class SchedulerJob:
     request: ResponseRequest
-    result_future: Future[EngineResult]
+    stream_handle: SynthesisHandle
     enqueued_at: float
     job_id: int = 0
     fairness_key: str | None = None
@@ -88,7 +92,7 @@ class _FairPendingQueue:
         self,
         *,
         request: ResponseRequest,
-        result_future: Future[EngineResult],
+        stream_handle: SynthesisHandle,
         now: float,
     ) -> SchedulerJob:
         self._expire_idle_states(now)
@@ -120,7 +124,7 @@ class _FairPendingQueue:
 
         job = SchedulerJob(
             request=request,
-            result_future=result_future,
+            stream_handle=stream_handle,
             enqueued_at=now,
             job_id=self._next_job_id,
             fairness_key=fairness_key,
@@ -130,6 +134,21 @@ class _FairPendingQueue:
         state.idle_since = None
         self._pending_count += 1
         return job
+
+    def remove(self, job: SchedulerJob, *, now: float) -> bool:
+        state = self._states.get(job.fairness_key)
+        if state is None:
+            return False
+        match = next(
+            (candidate for candidate in state.pending_jobs if candidate.job_id == job.job_id),
+            None,
+        )
+        if match is None:
+            return False
+        state.pending_jobs.remove(match)
+        self._pending_count -= 1
+        self._mark_idle_if_needed(state, now)
+        return True
 
     def pop_next(self, *, now: float) -> SchedulerJob | None:
         self._expire_idle_states(now)
@@ -259,12 +278,14 @@ class LoadedModelExecutor:
         *,
         model_name: str,
         complete_fn: Callable[[ResponseRequest], EngineResult],
+        stream_fn: Callable[[ResponseRequest, SynthesisHandle], RuntimeStreamResult] | None = None,
         configured_target_inflight: int,
         fairness_settings: FairnessSettings,
         runtime_capability: int = 1,
     ) -> None:
         self.model_name = str(model_name)
         self._complete_fn = complete_fn
+        self._stream_fn = stream_fn
         self._configured_target_inflight = max(1, int(configured_target_inflight))
         self._effective_target_inflight = min(self._configured_target_inflight, max(1, int(runtime_capability)))
         self._pending_queue = _FairPendingQueue(
@@ -274,6 +295,7 @@ class LoadedModelExecutor:
         self._accepting_new_requests = True
         self._stop_requested = False
         self._runtime_inflight = 0
+        self._active_stream_handles: dict[int, SynthesisHandle] = {}
         self._cond = threading.Condition()
         self._thread = threading.Thread(
             target=self._run_loop,
@@ -284,18 +306,17 @@ class LoadedModelExecutor:
     def start(self) -> None:
         self._thread.start()
 
-    def enqueue(self, request: ResponseRequest) -> Future[EngineResult]:
-        result_future: Future[EngineResult] = Future()
+    def enqueue_stream(self, request: ResponseRequest, handle: SynthesisHandle) -> None:
         with self._cond:
             if not self._accepting_new_requests or self._stop_requested:
                 raise ModelStateError(self.model_name, "model_unloading")
-            self._pending_queue.enqueue(
+            job = self._pending_queue.enqueue(
                 request=request,
-                result_future=result_future,
+                stream_handle=handle,
                 now=time.perf_counter(),
             )
+            handle.set_cancel_callback(lambda: self._cancel_stream_job(job))
             self._cond.notify_all()
-        return result_future
 
     def snapshot(self) -> ExecutorSnapshot:
         with self._cond:
@@ -313,13 +334,17 @@ class LoadedModelExecutor:
 
     def begin_shutdown(self) -> None:
         cancelled_jobs: list[SchedulerJob] = []
+        active_handles: list[SynthesisHandle] = []
         with self._cond:
             self._accepting_new_requests = False
             self._stop_requested = True
             cancelled_jobs.extend(self._pending_queue.drain(now=time.perf_counter()))
+            active_handles.extend(self._active_stream_handles.values())
             self._cond.notify_all()
         for job in cancelled_jobs:
-            self._set_future_exception(job.result_future, ModelStateError(self.model_name, "model_unloading"))
+            self._fail_job(job, ModelStateError(self.model_name, "model_unloading"))
+        for handle in active_handles:
+            handle.cancel()
 
     def join(self, timeout: float | None = None) -> None:
         self._thread.join(timeout=timeout)
@@ -343,6 +368,7 @@ class LoadedModelExecutor:
                         if job is None:
                             continue
                         self._runtime_inflight += 1
+                        self._active_stream_handles[job.job_id] = job.stream_handle
                         break
                     self._cond.wait()
             try:
@@ -357,29 +383,29 @@ class LoadedModelExecutor:
                 with self._cond:
                     if self._runtime_inflight > 0:
                         self._runtime_inflight -= 1
+                    self._active_stream_handles.pop(job.job_id, None)
                     self._pending_queue.abandon(job, now=time.perf_counter())
                     self._cond.notify_all()
-                self._set_future_exception(job.result_future, exc)
+                self._fail_job(job, exc)
 
     def _run_job(self, *, job: SchedulerJob, dequeued_at: float) -> None:
-        result: EngineResult | None = None
+        stream_result: RuntimeStreamResult | None = None
         error: Exception | None = None
         backend_started_at = time.perf_counter()
         backend_finished_at: float | None = None
         try:
-            result = self._complete_fn(job.request)
-            backend_finished_at = time.perf_counter()
-            metrics = dict(result.metrics)
-            metrics["engine_queue_wait_ms"] = max(0.0, (dequeued_at - job.enqueued_at) * 1000.0)
-            metrics["backend_synthesis_wall_ms"] = max(0.0, (backend_finished_at - backend_started_at) * 1000.0)
-            result = EngineResult(
-                audio=result.audio,
-                mime_type=result.mime_type,
-                sample_rate_hz=result.sample_rate_hz,
-                duration_ms=result.duration_ms,
-                metrics=metrics,
-                metadata=result.metadata,
+            job.stream_handle.mark_dispatched(
+                queue_wait_ms=max(0.0, (dequeued_at - job.enqueued_at) * 1000.0)
             )
+            if job.stream_handle.cancelled:
+                raise SynthesisCancelled("synthesis was cancelled before runtime dispatch")
+            stream_fn = self._stream_fn
+            if stream_fn is not None:
+                stream_result = stream_fn(job.request, job.stream_handle)
+            else:
+                result = self._complete_fn(job.request)
+                stream_result = _emit_complete_result(result, job.stream_handle)
+            backend_finished_at = time.perf_counter()
         except Exception as exc:
             error = exc
         finally:
@@ -389,6 +415,7 @@ class LoadedModelExecutor:
             with self._cond:
                 if self._runtime_inflight > 0:
                     self._runtime_inflight -= 1
+                self._active_stream_handles.pop(job.job_id, None)
                 self._pending_queue.complete(
                     job,
                     service_ms=service_ms,
@@ -396,20 +423,73 @@ class LoadedModelExecutor:
                 )
                 self._cond.notify_all()
         if error is not None:
-            self._set_future_exception(job.result_future, error)
-        elif result is not None:
-            self._set_future_result(job.result_future, result)
+            self._fail_job(job, error)
+        elif stream_result is not None:
+            total_ms = max(0.0, (backend_finished_at - job.stream_handle.created_at) * 1000.0)
+            backend_ms = max(0.0, (backend_finished_at - backend_started_at) * 1000.0)
+            metrics = dict(stream_result.metrics)
+            metrics["engine_queue_wait_ms"] = job.stream_handle.scheduler_queue_wait_ms
+            metrics["backend_synthesis_wall_ms"] = backend_ms
+            metrics["engine_total_wall_ms"] = total_ms
+            metrics["engine_outside_backend_wall_ms"] = max(0.0, total_ms - backend_ms)
+            job.stream_handle.complete(stream_result, metrics=metrics)
 
-    @staticmethod
-    def _set_future_result(result_future: Future[EngineResult], result: EngineResult) -> None:
-        try:
-            result_future.set_result(result)
-        except Exception:
-            pass
+    def _cancel_stream_job(self, job: SchedulerJob) -> None:
+        removed = False
+        with self._cond:
+            removed = self._pending_queue.remove(job, now=time.perf_counter())
+            if removed:
+                self._cond.notify_all()
+        if removed:
+            job.stream_handle.fail(SynthesisCancelled("synthesis was cancelled while queued"))
 
-    @staticmethod
-    def _set_future_exception(result_future: Future[EngineResult], exc: Exception) -> None:
-        try:
-            result_future.set_exception(exc)
-        except Exception:
-            pass
+    def _fail_job(self, job: SchedulerJob, error: Exception) -> None:
+        job.stream_handle.fail(error)
+
+
+def _emit_complete_result(result: EngineResult, handle: SynthesisHandle) -> RuntimeStreamResult:
+    if result.mime_type not in {"audio/wav", "audio/x-wav"}:
+        raise ValueError("complete-only runtime must return WAV audio")
+    try:
+        source = wave.open(io.BytesIO(result.audio), "rb")
+    except (EOFError, wave.Error) as exc:
+        raise ValueError("complete-only runtime returned invalid WAV audio") from exc
+    with source:
+        channel_count = source.getnchannels()
+        sample_width = source.getsampwidth()
+        sample_rate_hz = source.getframerate()
+        if channel_count != 1 or sample_width != 2 or source.getcomptype() != "NONE":
+            raise ValueError("complete-only runtime must return mono PCM S16LE WAV audio")
+        frame_bytes = channel_count * sample_width
+        chunk_bytes = min(handle.max_audio_chunk_bytes, 64 * 1024)
+        chunk_bytes -= chunk_bytes % frame_bytes
+        if chunk_bytes <= 0:
+            raise ValueError("stream buffer is smaller than one PCM frame")
+        frames_per_chunk = chunk_bytes // frame_bytes
+        handle.emit_started(sample_rate_hz=sample_rate_hz, channel_count=channel_count)
+        sequence_number = 0
+        first_sample = 0
+        while True:
+            pcm = source.readframes(frames_per_chunk)
+            if not pcm:
+                break
+            handle.emit_audio(
+                sequence_number=sequence_number,
+                first_sample=first_sample,
+                pcm=pcm,
+            )
+            sequence_number += 1
+            first_sample += len(pcm) // frame_bytes
+
+    duration_ms = result.duration_ms
+    if duration_ms is None:
+        duration_ms = round(first_sample * 1000 / sample_rate_hz)
+    metadata = dict(result.metadata)
+    metadata["native_streaming"] = False
+    return RuntimeStreamResult(
+        total_sample_count=first_sample,
+        duration_ms=duration_ms,
+        chunk_count=sequence_number,
+        metrics=dict(result.metrics),
+        metadata=metadata,
+    )

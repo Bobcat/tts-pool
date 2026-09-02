@@ -5,11 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tts-pool-dev"
 version = "0.1.0"
-description = "FastAPI TTS pool service with a single response API across TTS engines."
+description = "TTS pool service with gRPC synthesis and an HTTP control plane."
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
 dependencies = [
   "fastapi>=0.110",
+  "grpcio>=1.83",
+  "grpcio-health-checking>=1.83",
+  "protobuf>=7.35.1",
   "uvicorn>=0.30",
   "pydantic>=2.6",
   "voxcpm==2.0.2",
@@ -21,6 +24,9 @@ kokoro = [
   "misaki[ja,zh]>=0.9.4",
   "numpy>=1.26",
 ]
+dev = [
+  "grpcio-tools>=1.83",
+]
 
 [tool.setuptools]
-packages = ["app", "app.engine"]
+packages = ["app", "app.engine", "app.grpc_api", "app.grpc_api.v1"]

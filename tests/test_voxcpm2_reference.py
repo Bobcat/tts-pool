@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import io
 import unittest
 import wave
@@ -54,7 +53,7 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
         runtime._model = model
         reference = ReferenceAudio(
             mime_type="audio/wav",
-            data_base64=base64.b64encode(_silent_wav(seconds=2.0)).decode("ascii"),
+            data=_silent_wav(seconds=2.0),
             max_duration_s=1.0,
         )
 
@@ -90,7 +89,7 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
         runtime._model = model
         reference = ReferenceAudio(
             mime_type="audio/wav",
-            data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+            data=_silent_wav(seconds=1.0),
             max_duration_s=1.0,
             prompt_text="Ik lees dit korte bericht met een rustige stem.",
         )
@@ -125,7 +124,7 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
         runtime._model = model
         reference = ReferenceAudio(
             mime_type="audio/wav",
-            data_base64=base64.b64encode(_silent_wav(seconds=2.0)).decode("ascii"),
+            data=_silent_wav(seconds=2.0),
             max_duration_s=1.0,
             prompt_text="Ik lees dit korte bericht met een rustige stem.",
         )
@@ -157,7 +156,7 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
         runtime._model = model
         reference = ReferenceAudio(
             mime_type="audio/wav",
-            data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+            data=_silent_wav(seconds=1.0),
             max_duration_s=1.0,
             prompt_text="Ik lees dit korte bericht met een rustige stem.",
             also_use_as_reference=False,
@@ -194,7 +193,7 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
         runtime._model = model
         reference = ReferenceAudio(
             mime_type="audio/wav",
-            data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+            data=_silent_wav(seconds=1.0),
             max_duration_s=1.0,
         )
 
@@ -225,7 +224,7 @@ class VoxCPM2ReferenceTests(unittest.TestCase):
         runtime._model = model
         reference = ReferenceAudio(
             mime_type="audio/wav",
-            data_base64=base64.b64encode(_silent_wav(seconds=1.0)).decode("ascii"),
+            data=_silent_wav(seconds=1.0),
             max_duration_s=1.0,
         )
 
